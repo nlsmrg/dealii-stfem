@@ -18,8 +18,8 @@
 
 #include "exact_solution.h"
 #include "fe_time.h"
-#include "stmg.h"
 #include "operators.h"
+#include "stmg.h"
 #include "time_integrators.h"
 
 using namespace dealii;

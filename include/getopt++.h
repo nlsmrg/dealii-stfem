@@ -23,7 +23,7 @@ namespace util
     static constexpr int none     = 0; /** enable/disable things, e.g. help */
     static constexpr int required = 1; /** argument for setting variables */
     static constexpr int optional = 2; /** unclear */
-  } // namespace arg_type
+  }                                    // namespace arg_type
   using option_map_ = std::map<char, std::any>;
   using option_map  = std::shared_ptr<option_map_>;
 
@@ -189,13 +189,13 @@ namespace util
       bool                                     matched;
       std::function<bool(const std::string &)> parse;
     };
-    std::map<char, opt_info>   events;
-    std::vector<struct option> options;
-    std::string                searchstring;
-    std::string                help{"Available options:\n"};
-    bool                       help_on_destruct{false};
-    const int                  argc_{0};
-    char                     **argv_;
+    std::map<char, opt_info>       events;
+    std::vector<struct option>     options;
+    std::string                    searchstring;
+    std::string                    help{"Available options:\n"};
+    bool                           help_on_destruct{false};
+    const int                      argc_{0};
+    char                         **argv_;
     static constexpr struct option null_opt
     {
       nullptr, 0, nullptr, 0

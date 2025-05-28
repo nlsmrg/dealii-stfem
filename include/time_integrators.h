@@ -33,21 +33,20 @@ namespace dealii
     using VectorType      = VectorT<Number>;
     using BlockVectorType = BlockVectorT<Number>;
 
-    TimeIntegrator(
-      TimeStepType              type_,
-      unsigned int              time_degree_,
-      FullMatrix<Number> const &Alpha_,
-      FullMatrix<Number> const &Gamma_,
-      double const              gmres_tolerance_,
-      System const             &matrix_,
-      Preconditioner const     &preconditioner_,
-      RHSSystem const          &rhs_matrix_,
-      std::vector<std::function<void(const double, VectorType &)>>
-                               integrate_rhs_function,
-      unsigned int             n_timesteps_at_once_,
-      bool                     extrapolate_,
-      const NitscheIntegrator &nitsche_             = NitscheIntegrator(),
-      double                   abstol               = 1.e-12)
+    TimeIntegrator(TimeStepType              type_,
+                   unsigned int              time_degree_,
+                   FullMatrix<Number> const &Alpha_,
+                   FullMatrix<Number> const &Gamma_,
+                   double const              gmres_tolerance_,
+                   System const             &matrix_,
+                   Preconditioner const     &preconditioner_,
+                   RHSSystem const          &rhs_matrix_,
+                   std::vector<std::function<void(const double, VectorType &)>>
+                                            integrate_rhs_function,
+                   unsigned int             n_timesteps_at_once_,
+                   bool                     extrapolate_,
+                   const NitscheIntegrator &nitsche_ = NitscheIntegrator(),
+                   double                   abstol   = 1.e-12)
       : type(type_)
       , time_degree(time_degree_)
       , quad_time(get_time_quad(type, time_degree))
@@ -259,9 +258,9 @@ namespace dealii
       std::vector<std::function<void(const double, VectorType &)>>
                                integrate_rhs_function,
       unsigned int             n_timesteps_at_once_,
-      bool                     extrapolate          = true,
-      const NitscheIntegrator &nitsche              = NitscheIntegrator(),
-      double                   abstol               = 1.e-12)
+      bool                     extrapolate = true,
+      const NitscheIntegrator &nitsche     = NitscheIntegrator(),
+      double                   abstol      = 1.e-12)
       : TimeIntegrator<dim,
                        Number,
                        Preconditioner,

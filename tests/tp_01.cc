@@ -435,7 +435,7 @@ test(dealii::ConditionalOStream &pcout,
     for (unsigned int i = 0; i < n_blocks; ++i)
       {
         matrix->initialize_dof_vector(x.block(i));
-				matrix->initialize_dof_vector(rhs.block(i));
+        matrix->initialize_dof_vector(rhs.block(i));
       }
     VectorType prev_x, prev_v;
     matrix->initialize_dof_vector(prev_x);
