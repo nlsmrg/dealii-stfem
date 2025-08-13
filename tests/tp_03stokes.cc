@@ -723,7 +723,8 @@ test(dealii::ConditionalOStream &pcout,
                   blk_indices[i],
                   K_mask,
                   M_mask,
-                  parameters.is_nonlinear);
+                  parameters.is_nonlinear,
+                  parameters.patch_type == PatchType::element);
           }
 #ifdef MATRIX_BASED
         *Stokes = 0;

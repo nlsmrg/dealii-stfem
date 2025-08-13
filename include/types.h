@@ -127,6 +127,12 @@ enum class NonlinearExtrapolation : unsigned int
   LeastSquares = 3,
 };
 
+enum class PatchType
+{
+  element,
+  vertex_star,
+};
+
 static std::unordered_map<std::string, ProblemType> const str_to_problem_type =
   {{"heat", ProblemType::heat},
    {"wave", ProblemType::wave},
@@ -173,3 +179,7 @@ static std::unordered_map<std::string, NonlinearExtrapolation> const
     {"constant", NonlinearExtrapolation::Constant},
     {"polynomial", NonlinearExtrapolation::Polynomial},
     {"leastSquares", NonlinearExtrapolation::LeastSquares}};
+
+
+static std::unordered_map<std::string, PatchType> const str_to_patch_type =
+  {{"element", PatchType::element}, {"vertexStar", PatchType::vertex_star}};

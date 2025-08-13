@@ -40,6 +40,7 @@ namespace dealii
     bool                   time_before_space      = false;
     TimeStepType           type                   = TimeStepType::CGP;
     ProblemType            problem                = ProblemType::wave;
+    PatchType              patch_type             = PatchType::element;
     NonlinearTreatment     nonlinear_treatment = NonlinearTreatment::Implicit;
     NonlinearExtrapolation nonlinear_extrapolation =
       NonlinearExtrapolation::Auto;
@@ -87,7 +88,8 @@ namespace dealii
     {
       std::string type_, problem_,
         p_mg_ = "bisect", c_type_ = "space_or_time", smoother = "relaxation",
-        nonlinear_treatment_ = "none", nonlinear_extra_ = "auto";
+        nonlinear_treatment_ = "none", nonlinear_extra_ = "auto",
+        patch_type_ = "element";
       dealii::ParameterHandler prm;
       prm.add_parameter("doOutput", do_output);
       prm.add_parameter("doHigherOrderOutput", do_higher_order_output);
@@ -96,6 +98,7 @@ namespace dealii
       prm.add_parameter("mgTimeBeforeSpace", time_before_space);
       prm.add_parameter("timeType", type_);
       prm.add_parameter("problemType", problem_);
+      prm.add_parameter("patchType", patch_type_);
       prm.add_parameter("nonlinearTreatment", nonlinear_treatment_);
       prm.add_parameter("nonlinearExtrapolation", nonlinear_extra_);
       prm.add_parameter("pMgType", p_mg_);
@@ -152,6 +155,7 @@ namespace dealii
       prm.parse_input_from_json(file, true);
       type                = str_to_time_type.at(type_);
       problem             = str_to_problem_type.at(problem_);
+      patch_type          = str_to_patch_type.at(patch_type_);
       nonlinear_treatment = str_to_nonlinear_treatment.at(nonlinear_treatment_);
       nonlinear_extrapolation =
         str_to_nonlinear_extrapolation.at(nonlinear_extra_);

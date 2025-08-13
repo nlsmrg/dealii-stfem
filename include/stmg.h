@@ -699,8 +699,7 @@ namespace dealii
             {
               const Point<dim> vertex_point = triangulation.get_vertices()[v];
               auto            &vertex_patch = vertex_patch_map[v];
-              // Stokes specific!
-              for (unsigned int i = 1; i < dof_handler.size(); ++i)
+              for (unsigned int i = 0; i < dof_handler.size(); ++i)
                 {
                   auto &fe = dof_handler[i]->get_fe();
                   std::vector<types::global_dof_index> patch_indices;
@@ -717,30 +716,34 @@ namespace dealii
                         for (unsigned int d = 0; d < fe.n_dofs_per_cell(); ++d)
                           {
                             bool exclude = false;
+                            if (i != 0) // Stokes specific!
+                              {
+                                auto gp =
+                                  fe.get_associated_geometry_primitive(d);
+                                if (dim == 2 && gp == GeometryPrimitive::quad)
+                                  exclude = false;
+                                else if (dim == 3 &&
+                                         gp == GeometryPrimitive::hex)
+                                  exclude = false;
+                                else
+                                  for (auto f : cell->face_indices())
+                                    {
+                                      if (!fe.has_support_on_face(f, d))
+                                        continue;
 
-                            auto gp = fe.get_associated_geometry_primitive(d);
-                            if (dim == 2 && gp == GeometryPrimitive::quad)
-                              exclude = false;
-                            else if (dim == 3 && gp == GeometryPrimitive::hex)
-                              exclude = false;
-                            else
-                              for (auto f : cell->face_indices())
-                                {
-                                  if (!fe.has_support_on_face(f, d))
-                                    continue;
+                                      const auto face      = cell->face(f);
+                                      bool       touches_v = false;
+                                      for (auto fv : face->vertex_indices())
+                                        if (face->vertex_index(fv) == v)
+                                          {
+                                            touches_v = true;
+                                            break;
+                                          }
 
-                                  const auto face      = cell->face(f);
-                                  bool       touches_v = false;
-                                  for (auto fv : face->vertex_indices())
-                                    if (face->vertex_index(fv) == v)
-                                      {
-                                        touches_v = true;
-                                        break;
-                                      }
-
-                                  if (!touches_v)
-                                    exclude = true;
-                                }
+                                      if (!touches_v)
+                                        exclude = true;
+                                    }
+                              }
                             if (!exclude)
                               patch_indices.push_back(local_to_global[d]);
                           }
