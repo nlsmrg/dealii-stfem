@@ -7,6 +7,8 @@
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/dofs/dof_tools.h>
 
+#include <deal.II/grid/grid_tools.h>
+
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/solver_control.h>
 #include <deal.II/lac/solver_gmres.h>
@@ -633,15 +635,16 @@ namespace dealii
       const FullMatrix<Number>                              &Beta,
       std::vector<const DoFHandler<dim> *> const            &dof_handler,
       const BlockSlice                                      &blk_slice_,
-      const Table<2, bool> &K_mask       = Table<2, bool>(),
-      const Table<2, bool> &M_mask       = Table<2, bool>(),
-      bool                  build_cache_ = false)
+      const Table<2, bool> &K_mask          = Table<2, bool>(),
+      const Table<2, bool> &M_mask          = Table<2, bool>(),
+      bool                  build_cache_    = false,
+      bool                  element_centric = true)
       : timer(timer)
       , blk_slice(blk_slice_)
       , build_cache(build_cache_)
       , SPB(SP_)
     {
-      reinit(K_, M_, Alpha, Beta, dof_handler, K_mask, M_mask);
+      reinit(K_, M_, Alpha, Beta, dof_handler, K_mask, M_mask, element_centric);
       if (!build_cache)
         SPB.reset();
     }
@@ -653,9 +656,11 @@ namespace dealii
            const FullMatrix<Number>                           &Alpha,
            const FullMatrix<Number>                           &Beta,
            std::vector<const DoFHandler<dim> *> const         &dof_handler,
-           const Table<2, bool> &K_mask = Table<2, bool>(),
-           const Table<2, bool> &M_mask = Table<2, bool>())
+           const Table<2, bool> &K_mask          = Table<2, bool>(),
+           const Table<2, bool> &M_mask          = Table<2, bool>(),
+           bool                  element_centric = true)
     {
+      this->clear();
       AssertDimension(SPB->n_block_rows(), dof_handler.size());
       std::vector<IndexSet> locally_relevant_dofs(SPB->n_block_rows());
       BlockVectorType       valence(SPB->n_block_rows());
@@ -670,21 +675,90 @@ namespace dealii
         }
 
       indices.resize(SPB->n_block_rows());
-      for (unsigned int i = 0; i < dof_handler.size(); ++i)
-        for (const auto &cell : dof_handler[i]->active_cell_iterators())
-          {
-            if (cell->is_locally_owned())
-              {
-                std::vector<types::global_dof_index> my_indices(
-                  cell->get_fe().n_dofs_per_cell());
-                cell->get_dof_indices(my_indices);
-                for (auto const &dof_index : my_indices)
-                  valence.block(i)[dof_index] += static_cast<Number>(1);
+      if (element_centric)
+        for (unsigned int i = 0; i < dof_handler.size(); ++i)
+          for (const auto &cell : dof_handler[i]->active_cell_iterators())
+            {
+              if (cell->is_locally_owned())
+                {
+                  std::vector<types::global_dof_index> local_to_global(
+                    cell->get_fe().n_dofs_per_cell());
+                  cell->get_dof_indices(local_to_global);
+                  for (auto const &dof_index : local_to_global)
+                    valence.block(i)[dof_index] += static_cast<Number>(1);
 
-                indices[i].emplace_back(my_indices);
-              }
-          }
+                  indices[i].emplace_back(local_to_global);
+                }
+            }
+      else
+        {
+          const auto &triangulation = dof_handler[0]->get_triangulation();
+          auto vertex_patch_map = GridTools::vertex_to_cell_map(triangulation);
 
+          for (unsigned int v = 0; v < vertex_patch_map.size(); ++v)
+            {
+              const Point<dim> vertex_point = triangulation.get_vertices()[v];
+              auto            &vertex_patch = vertex_patch_map[v];
+              // Stokes specific!
+              for (unsigned int i = 1; i < dof_handler.size(); ++i)
+                {
+                  auto &fe = dof_handler[i]->get_fe();
+                  std::vector<types::global_dof_index> patch_indices;
+
+                  for (auto cell : vertex_patch)
+                    if (cell->is_locally_owned())
+                      {
+                        auto dof_cell =
+                          cell->as_dof_handler_iterator(*dof_handler[i]);
+                        std::vector<types::global_dof_index> local_to_global(
+                          dof_cell->get_fe().n_dofs_per_cell());
+                        dof_cell->get_dof_indices(local_to_global);
+
+                        for (unsigned int d = 0; d < fe.n_dofs_per_cell(); ++d)
+                          {
+                            bool exclude = false;
+
+                            auto gp = fe.get_associated_geometry_primitive(d);
+                            if (dim == 2 && gp == GeometryPrimitive::quad)
+                              exclude = false;
+                            else if (dim == 3 && gp == GeometryPrimitive::hex)
+                              exclude = false;
+                            else
+                              for (auto f : cell->face_indices())
+                                {
+                                  if (!fe.has_support_on_face(f, d))
+                                    continue;
+
+                                  const auto face      = cell->face(f);
+                                  bool       touches_v = false;
+                                  for (auto fv : face->vertex_indices())
+                                    if (face->vertex_index(fv) == v)
+                                      {
+                                        touches_v = true;
+                                        break;
+                                      }
+
+                                  if (!touches_v)
+                                    exclude = true;
+                                }
+                            if (!exclude)
+                              patch_indices.push_back(local_to_global[d]);
+                          }
+                      }
+
+                  std::sort(patch_indices.begin(), patch_indices.end());
+                  patch_indices.erase(std::unique(patch_indices.begin(),
+                                                  patch_indices.end()),
+                                      patch_indices.end());
+                  if (patch_indices.empty())
+                    continue;
+
+                  for (auto const &dof_index : patch_indices)
+                    valence.block(i)[dof_index] += static_cast<Number>(1);
+                  indices[i].emplace_back(patch_indices);
+                }
+            }
+        }
       valence.compress(VectorOperation::add);
       valence.update_ghost_values();
 
@@ -700,15 +774,24 @@ namespace dealii
                   K_->block(i, j), indices[i]));
         }
 
-
       auto K_blocks = SparseMatrixTools::restrict_to_full_block_matrices_(
         *K_, *SPB, indices, indices, valence, K_mask, cache);
       auto M_blocks = SparseMatrixTools::restrict_to_full_block_matrices_(
-        *M_, *SPB, indices, indices, valence, M_mask, cache);
+        *M_, *SPB, indices, indices, valence, M_mask);
       unsigned int td =
         blk_slice.n_timedofs() * blk_slice.n_timesteps_at_once();
 
-      blocks.resize(K_blocks(0, 0).size());
+      unsigned int n_blocks = 0;
+      for (unsigned int iv = 0; iv < blk_slice.n_variables(); ++iv)
+        for (unsigned int jv = 0; jv < blk_slice.n_variables(); ++jv)
+          if ((K_mask.empty() || K_mask(iv, jv)))
+            n_blocks = K_blocks(iv, jv).size();
+          else if ((M_mask.empty() || M_mask(iv, jv)))
+            n_blocks = M_blocks(iv, jv).size();
+
+      Assert(n_blocks != 0, ExcInternalError());
+      blocks.resize(n_blocks);
+
       for (unsigned int ii = 0; ii < blocks.size(); ++ii)
         {
           unsigned int n_sd = 0;
@@ -716,13 +799,14 @@ namespace dealii
             n_sd += indices[i][ii].size();
           auto &B = blocks[ii];
           B.reinit(n_sd * td, n_sd * td);
+          if (B.empty())
+            continue;
           for (unsigned int i = 0, r_o = 0; i < blk_slice.n_blocks(); ++i)
             {
               auto const &[it, iv, id] = blk_slice.decompose(i);
               for (unsigned int j = 0, c_o = 0; j < blk_slice.n_blocks(); ++j)
                 {
                   auto const &[jt, jv, jd] = blk_slice.decompose(j);
-                  const auto &K            = K_blocks(iv, jv)[ii];
                   if (Beta(i, j) != 0.0 && (M_mask.empty() || M_mask(iv, jv)))
                     {
                       const auto &M = M_blocks(iv, jv)[ii];
@@ -731,9 +815,12 @@ namespace dealii
                           B(r_o + k, c_o + l) += Beta(i, j) * M(k, l);
                     }
                   if (Alpha(i, j) != 0.0 && (K_mask.empty() || K_mask(iv, jv)))
-                    for (unsigned int k = 0; k < K.m(); ++k)
-                      for (unsigned int l = 0; l < K.n(); ++l)
-                        B(r_o + k, c_o + l) += Alpha(i, j) * K(k, l);
+                    {
+                      const auto &K = K_blocks(iv, jv)[ii];
+                      for (unsigned int k = 0; k < K.m(); ++k)
+                        for (unsigned int l = 0; l < K.n(); ++l)
+                          B(r_o + k, c_o + l) += Alpha(i, j) * K(k, l);
+                    }
                   c_o += indices[jv][ii].size();
                 }
               r_o += indices[iv][ii].size();
@@ -750,12 +837,13 @@ namespace dealii
                       const FullMatrix<Number>                         &Alpha,
                       const FullMatrix<Number>                         &Beta,
                       std::shared_ptr<const DoFHandler<dim>> const &dof_handler,
-                      bool build_cache_ = false)
+                      bool build_cache_    = false,
+                      bool element_centric = true)
       : timer(timer)
       , build_cache(build_cache_)
       , SP(SP_)
     {
-      reinit(K_, M_, Alpha, Beta, dof_handler);
+      reinit(K_, M_, Alpha, Beta, dof_handler, element_centric);
       if (!build_cache)
         SP.reset();
     }
@@ -766,8 +854,10 @@ namespace dealii
            std::shared_ptr<const SparseMatrixType> const &M_,
            const FullMatrix<Number>                      &Alpha,
            const FullMatrix<Number>                      &Beta,
-           std::shared_ptr<const DoFHandler<dim>> const  &dof_handler)
+           std::shared_ptr<const DoFHandler<dim>> const  &dof_handler,
+           bool element_centric = true)
     {
+      this->clear();
       std::vector<FullMatrix<Number>> K_blocks, M_blocks;
       IndexSet                        locally_relevant_dofs;
       DoFTools::extract_locally_relevant_dofs(*dof_handler,
@@ -779,17 +869,83 @@ namespace dealii
       this->indices.resize(1);
       auto &indices = this->indices[0];
 
-      for (const auto &cell : dof_handler->active_cell_iterators())
-        {
-          if (cell->is_locally_owned())
-            {
-              std::vector<types::global_dof_index> my_indices(
-                cell->get_fe().n_dofs_per_cell());
-              cell->get_dof_indices(my_indices);
-              for (auto const &dof_index : my_indices)
-                valence(dof_index) += static_cast<Number>(1);
+      if (element_centric)
+        for (const auto &cell : dof_handler->active_cell_iterators())
+          {
+            if (cell->is_locally_owned())
+              {
+                std::vector<types::global_dof_index> local_to_global(
+                  cell->get_fe().n_dofs_per_cell());
+                cell->get_dof_indices(local_to_global);
+                for (auto const &dof_index : local_to_global)
+                  valence(dof_index) += static_cast<Number>(1);
 
-              indices.emplace_back(my_indices);
+                indices.emplace_back(local_to_global);
+              }
+          }
+      else
+        {
+          const auto &triangulation = dof_handler->get_triangulation();
+          auto vertex_patch_map = GridTools::vertex_to_cell_map(triangulation);
+
+          for (unsigned int v = 0; v < vertex_patch_map.size(); ++v)
+            {
+              const Point<dim> vertex_point = triangulation.get_vertices()[v];
+              auto            &vertex_patch = vertex_patch_map[v];
+
+              auto                                &fe = dof_handler->get_fe();
+              std::vector<types::global_dof_index> patch_indices;
+
+              for (auto cell : vertex_patch)
+                if (cell->is_locally_owned())
+                  {
+                    auto dof_cell = cell->as_dof_handler_iterator(*dof_handler);
+                    std::vector<types::global_dof_index> local_to_global(
+                      dof_cell->get_fe().n_dofs_per_cell());
+                    dof_cell->get_dof_indices(local_to_global);
+
+                    for (unsigned int d = 0; d < fe.n_dofs_per_cell(); ++d)
+                      {
+                        bool exclude = false;
+
+                        auto gp = fe.get_associated_geometry_primitive(d);
+                        if ((dim == 2 && gp == GeometryPrimitive::quad) ||
+                            (dim == 3 && gp == GeometryPrimitive::hex))
+                          exclude = false;
+                        else
+                          for (auto f : cell->face_indices())
+                            {
+                              if (!fe.has_support_on_face(f, d))
+                                continue;
+
+                              const auto face      = cell->face(f);
+                              bool       touches_v = false;
+                              for (auto fv : face->vertex_indices())
+                                if (face->vertex_index(fv) == v)
+                                  {
+                                    touches_v = true;
+                                    break;
+                                  }
+
+                              if (!touches_v)
+                                exclude = true;
+                            }
+
+                        if (!exclude)
+                          patch_indices.push_back(local_to_global[d]);
+                      }
+                  }
+
+              std::sort(patch_indices.begin(), patch_indices.end());
+              patch_indices.erase(std::unique(patch_indices.begin(),
+                                              patch_indices.end()),
+                                  patch_indices.end());
+              if (patch_indices.empty())
+                continue;
+
+              for (auto const &dof_index : patch_indices)
+                valence[dof_index] += static_cast<Number>(1);
+              indices.emplace_back(patch_indices);
             }
         }
       valence.compress(VectorOperation::add);
@@ -889,6 +1045,17 @@ namespace dealii
     {
       AssertDimension(blk_slice_.n_variables(), 1);
       blk_slice = blk_slice_;
+    }
+
+    size_t
+    nnz()
+    {
+      Assert(indices.size(), ExcInternalError());
+      Assert(indices[0].size(), ExcInternalError());
+      size_t total = 0;
+      for (const auto &block : blocks)
+        total += block.m() * block.n();
+      return total;
     }
 
   private:
