@@ -67,9 +67,11 @@ namespace dealii
     bool         extrapolate             = true;
     bool         colorize_boundary       = false;
     bool         nitsche_boundary        = false;
+    bool         symmetric_nitsche       = true;
     std::string  functional_file         = "functionals.txt";
     std::string  grid_descriptor         = "hyperRectangle";
     std::string  additional_file         = "";
+    std::string  newton_data_file        = "";
     Point<dim>   hyperrect_lower_left =
       dim == 2 ? Point<dim>(0., 0.) : Point<dim>(0., 0., 0.);
     Point<dim> hyperrect_upper_right =
@@ -120,9 +122,11 @@ namespace dealii
       prm.add_parameter("extrapolate", extrapolate);
       prm.add_parameter("colorizeBoundary", colorize_boundary);
       prm.add_parameter("nitscheBoundary", nitsche_boundary);
+      prm.add_parameter("symmetricNitsche", symmetric_nitsche);
       prm.add_parameter("functionalFile", functional_file);
       prm.add_parameter("gridDescriptor", grid_descriptor);
       prm.add_parameter("additionalFile", additional_file);
+      prm.add_parameter("newtonDataFile", newton_data_file);
       prm.add_parameter("hyperRectLowerLeft", hyperrect_lower_left);
       prm.add_parameter("hyperRectUpperRight", hyperrect_upper_right);
       prm.add_parameter("subdivisions", subdivisions);

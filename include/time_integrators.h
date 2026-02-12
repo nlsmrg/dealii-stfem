@@ -6,6 +6,7 @@
 #include <deal.II/lac/solver_control.h>
 #include <deal.II/lac/solver_gmres.h>
 
+#include "newton.h"
 #include "operators.h"
 #include "stmg.h"
 #include "types.h"
@@ -32,30 +33,41 @@ namespace dealii
   public:
     using VectorType      = VectorT<Number>;
     using BlockVectorType = BlockVectorT<Number>;
+    using NonlinearSolver = Newton<dim, Number, BlockVectorType, System>;
 
-    TimeIntegrator(TimeStepType              type_,
-                   unsigned int              time_degree_,
-                   FullMatrix<Number> const &Alpha_,
-                   FullMatrix<Number> const &Gamma_,
-                   double const              gmres_tolerance_,
-                   System const             &matrix_,
-                   Preconditioner const     &preconditioner_,
-                   RHSSystem const          &rhs_matrix_,
-                   std::vector<std::function<void(const double, VectorType &)>>
-                                            integrate_rhs_function,
-                   unsigned int             n_timesteps_at_once_,
-                   bool                     extrapolate_,
-                   const NitscheIntegrator &nitsche_ = NitscheIntegrator(),
-                   double                   abstol   = 1.e-12)
+    TimeIntegrator(
+      TimeStepType              type_,
+      unsigned int              time_degree_,
+      FullMatrix<Number> const &Alpha_,
+      FullMatrix<Number> const &Gamma_,
+      double const              gmres_tolerance_,
+      System const             &matrix_,
+      Preconditioner const     &preconditioner_,
+      RHSSystem const          &rhs_matrix_,
+      std::vector<std::function<void(const double, VectorType &)>>
+                               integrate_rhs_function,
+      unsigned int             n_timesteps_at_once_,
+      bool                     extrapolate_,
+      const NitscheIntegrator &nitsche_             = NitscheIntegrator(),
+      NonlinearTreatment       nonlinear_treatment_ = NonlinearTreatment::None,
+      double                   abstol               = 1.e-12)
       : type(type_)
       , time_degree(time_degree_)
       , quad_time(get_time_quad(type, time_degree))
       , Alpha(Alpha_)
       , Gamma(Gamma_)
-      , solver_control(200, abstol, gmres_tolerance_, false, true)
+      , solver_control(nonlinear_treatment_ == NonlinearTreatment::Implicit ?
+                         50 :
+                         200,
+                       abstol,
+                       gmres_tolerance_,
+                       false,
+                       true)
       , solver(solver_control,
-               typename SolverFGMRES<
-                 BlockVectorType>::AdditionalData::AdditionalData(100))
+               typename SolverFGMRES<BlockVectorType>::AdditionalData::
+                 AdditionalData(
+                   nonlinear_treatment_ == NonlinearTreatment::Implicit ? 50 :
+                                                                          100))
       , preconditioner(preconditioner_)
       , matrix(matrix_)
       , rhs_matrix(rhs_matrix_)
@@ -67,6 +79,7 @@ namespace dealii
             (type == TimeStepType::DG ? time_degree + 1 : time_degree))
       , dirichlet_color_to_fun(idx.n_variables())
       , do_extrapolate(extrapolate_)
+      , nonlinear_treatment(nonlinear_treatment_)
     {}
 
     void
@@ -172,10 +185,72 @@ namespace dealii
     unsigned int
     last_step() const
     {
-      return solver_control.last_step();
+      if (nonlinear_treatment == NonlinearTreatment::Implicit)
+        return total_lin_iter;
+      else
+        return solver_control.last_step();
     }
 
+    unsigned int
+    nonlinear_steps() const
+    {
+      if (nonlinear_treatment == NonlinearTreatment::Implicit)
+        return total_nonlinear_iter;
+      else
+        return 1u;
+    }
+
+    void
+    setup_nonlinear(NewtonData const &newton_data) const
+    {
+      Assert(nonlinear_treatment == NonlinearTreatment::None ||
+               update_linearization_user,
+             ExcInternalError());
+      if (nonlinear_treatment == NonlinearTreatment::Implicit)
+        nonlinear_solver = std::make_unique<NonlinearSolver>(
+          newton_data,
+          matrix,
+          this->update_linearization_user,
+          this->update_preconditioner_user,
+          [this](BlockVectorType &x, BlockVectorType const &rhs) {
+            try
+              {
+                this->solver.solve(this->matrix, x, rhs, this->preconditioner);
+              }
+            catch (const SolverControl::NoConvergence &e)
+              {
+                // Let Newton handle problems
+              }
+            return solver_control.last_step();
+          },
+          [this](double tol) { solver_control.set_reduction(tol); });
+    }
+
+    std::function<void(BlockVectorType const &)> update_linearization_user;
+    std::function<void()>                        update_preconditioner_user;
+
   protected:
+    void
+    update_linearization(BlockVectorType const &x) const
+    {
+      Assert(nonlinear_treatment == NonlinearTreatment::None ||
+               update_linearization_user,
+             ExcInternalError());
+      if (nonlinear_treatment != NonlinearTreatment::None)
+        this->update_linearization_user(x);
+    }
+    void
+    update_preconditioner() const
+    {
+      ++update_calls;
+      Assert(nonlinear_treatment == NonlinearTreatment::None ||
+               update_preconditioner_user,
+             ExcInternalError());
+      if ((update_calls % update_every_step == 0) &&
+          nonlinear_treatment != NonlinearTreatment::None)
+        this->update_preconditioner_user();
+    }
+
     void
     extrapolate(BlockVectorType &x, BlockVectorType const &prev_x) const
     {
@@ -196,12 +271,13 @@ namespace dealii
     FullMatrix<Number> const &Alpha;
     FullMatrix<Number> const &Gamma;
 
-    mutable ReductionControl              solver_control;
-    mutable SolverFGMRES<BlockVectorType> solver;
-    Preconditioner const                 &preconditioner;
-    System const                         &matrix;
-    RHSSystem const                      &rhs_matrix;
-    NitscheIntegrator const              &nitsche;
+    mutable ReductionControl                 solver_control;
+    mutable SolverFGMRES<BlockVectorType>    solver;
+    Preconditioner const                    &preconditioner;
+    System const                            &matrix;
+    RHSSystem const                         &rhs_matrix;
+    NitscheIntegrator const                 &nitsche;
+    mutable std::unique_ptr<NonlinearSolver> nonlinear_solver;
 
     std::vector<std::function<void(const double, VectorType &)>>
                  integrate_rhs_function;
@@ -215,7 +291,8 @@ namespace dealii
 
     bool                 do_extrapolate;
     FullMatrix<Number>   extrapolation_matrix;
-    mutable unsigned int total_lin_iter;
+    NonlinearTreatment   nonlinear_treatment;
+    mutable unsigned int total_lin_iter, total_nonlinear_iter;
   };
 
 
@@ -246,6 +323,14 @@ namespace dealii
                               System,
                               RHSSystem,
                               NitscheIntegrator>::BlockVectorType;
+    using NonlinearSolver =
+      typename TimeIntegrator<dim,
+                              Number,
+                              Preconditioner,
+                              System,
+                              RHSSystem,
+                              NitscheIntegrator>::NonlinearSolver;
+
     TimeIntegratorFO(
       TimeStepType              type_,
       unsigned int              time_degree_,
@@ -258,9 +343,10 @@ namespace dealii
       std::vector<std::function<void(const double, VectorType &)>>
                                integrate_rhs_function,
       unsigned int             n_timesteps_at_once_,
-      bool                     extrapolate = true,
-      const NitscheIntegrator &nitsche     = NitscheIntegrator(),
-      double                   abstol      = 1.e-12)
+      bool                     extrapolate          = true,
+      const NitscheIntegrator &nitsche              = NitscheIntegrator(),
+      NonlinearTreatment       nonlinear_treatment_ = NonlinearTreatment::None,
+      double                   abstol               = 1.e-12)
       : TimeIntegrator<dim,
                        Number,
                        Preconditioner,
@@ -278,6 +364,7 @@ namespace dealii
                                           n_timesteps_at_once_,
                                           extrapolate,
                                           nitsche,
+                                          nonlinear_treatment_,
                                           abstol)
     {}
 
@@ -304,19 +391,31 @@ namespace dealii
           const double time,
           const double time_step) const
     {
+      if (this->type == TimeStepType::CGP &&
+          this->nonlinear_treatment != NonlinearTreatment::None)
+        this->rhs_matrix.set_data(prev_x);
       this->rhs_matrix.vmult_slice(rhs, prev_x);
       this->assemble_nitsche(rhs, time, time_step);
       this->assemble_force(rhs, time, time_step);
       this->matrix.set_rhs(rhs);
       this->extrapolate(x, prev_x);
-      try
+      this->update_linearization(x);
+      this->update_preconditioner();
+      if (this->nonlinear_treatment == NonlinearTreatment::Implicit)
         {
-          this->solver.solve(this->matrix, x, rhs, this->preconditioner);
+          auto [nl_iter, l_iter]     = this->nonlinear_solver->solve(x, rhs);
+          this->total_lin_iter       = l_iter;
+          this->total_nonlinear_iter = nl_iter;
         }
-      catch (const SolverControl::NoConvergence &e)
-        {
-          AssertThrow(false, ExcMessage(e.what()));
-        }
+      else
+        try
+          {
+            this->solver.solve(this->matrix, x, rhs, this->preconditioner);
+          }
+        catch (const SolverControl::NoConvergence &e)
+          {
+            // AssertThrow(false, ExcMessage(e.what()));
+          }
     }
 
 

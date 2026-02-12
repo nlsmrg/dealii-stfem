@@ -23,6 +23,30 @@
 
 namespace dealii
 {
+  template <typename Number, std::size_t width>
+  inline DEAL_II_ALWAYS_INLINE VectorizedArray<Number, width>
+  operator>=(const VectorizedArray<Number, width> &lhs,
+             const VectorizedArray<Number, width> &rhs)
+  {
+    VectorizedArray<Number, width> tmp;
+    for (unsigned int i = 0; i < VectorizedArray<Number, width>::size(); ++i)
+      tmp[i] = static_cast<Number>(lhs[i] >= rhs[i]);
+
+    return tmp;
+  }
+
+  template <typename Number, std::size_t width>
+  inline DEAL_II_ALWAYS_INLINE VectorizedArray<Number, width>
+  operator<(const VectorizedArray<Number, width> &lhs,
+            const VectorizedArray<Number, width> &rhs)
+  {
+    VectorizedArray<Number, width> tmp;
+    for (unsigned int i = 0; i < VectorizedArray<Number, width>::size(); ++i)
+      tmp[i] = static_cast<Number>(lhs[i] < rhs[i]);
+
+    return tmp;
+  }
+
   namespace internal
   {
     template <int dim, typename Number>
@@ -88,6 +112,36 @@ namespace dealii
         v[i] = g.value(point);
       });
     }
+
+    template <int dim, typename Number>
+    void
+    set_scalar_gradient(Tensor<1, dim, Number>                           &v,
+                        const Point<dim, Number>                         &p,
+                        const Function<dim, typename Number::value_type> &g)
+    {
+      set_values(v, p, [&g](auto &v, unsigned int i, const auto &point) {
+        auto g_grad = g.gradient(point, 0);
+        for (unsigned int d = 0; d < dim; ++d)
+          v[d][i] = g_grad[d];
+      });
+    }
+
+    template <int dim, typename Number>
+    void
+    set_vector_gradient(Tensor<2, dim, Number>                           &v,
+                        const Point<dim, Number>                         &p,
+                        const Function<dim, typename Number::value_type> &g)
+    {
+      set_values(v, p, [&g](auto &v, unsigned int i, const auto &point) {
+        for (unsigned int r = 0; r < dim; ++r)
+          {
+            auto g_grad = g.gradient(point, r);
+            for (unsigned int c = 0; c < dim; ++c)
+              v[r][c][i] = g_grad[c];
+          }
+      });
+    }
+
     template <typename Number>
     void
     scatter(BlockVectorT<Number>       &dst,
@@ -146,6 +200,19 @@ namespace dealii
                       std::declval<BlockVectorT<Number> const &>()))>>
       : std::true_type
     {};
+
+    template <typename T, typename Number, typename = std::void_t<>>
+    struct has_form_vector : std::false_type
+    {};
+
+    template <typename T, typename Number>
+    struct has_form_vector<T,
+                           Number,
+                           std::void_t<decltype(std::declval<T>().form(
+                             std::declval<VectorT<Number> &>(),
+                             std::declval<VectorT<Number> const &>()))>>
+      : std::true_type
+    {};
   } // namespace internal
 
   template <int dim, int n_components, typename Number>
@@ -153,6 +220,13 @@ namespace dealii
     typename std::conditional<n_components == dim,
                               Tensor<1, dim, VectorizedArray<Number>>,
                               VectorizedArray<Number>>::type;
+
+  template <int dim, int n_components, typename Number>
+  using DirichletGradient =
+    typename std::conditional<n_components == dim,
+                              Tensor<2, dim, VectorizedArray<Number>>,
+                              Tensor<1, dim, VectorizedArray<Number>>>::type;
+
 
   template <int dim, typename Number>
   void
@@ -475,28 +549,53 @@ namespace dealii
                            unsigned int           it,
                            unsigned int           id) const
     {
-      if constexpr (internal::has_set_data<T, Number>::value)
-        if (nonlinear)
-          {
-            AssertDimension(blk_slice.n_blocks(), vec.n_blocks());
-            member.set_data(blk_slice.get_variable(vec, it, id));
-          }
+      if (nonlinear)
+        {
+          if constexpr (internal::has_set_data<T, Number>::value)
+            {
+              AssertDimension(blk_slice.n_blocks(), vec.n_blocks());
+              member.set_data(blk_slice.get_variable(vec, it, id));
+            }
+          else
+            Assert(false, ExcInternalError());
+        }
     }
+
+    template <typename T>
+    void
+    set_linearization_data(T &member, VectorType const &vec) const
+    {
+      if (nonlinear)
+        {
+          if constexpr (internal::has_set_data<T, Number>::value)
+            {
+              BlockVectorSliceT<Number> vec_{std::cref(vec)};
+              member.set_data(std::move(vec_));
+            }
+          else
+            Assert(false, ExcInternalError());
+        }
+    }
+
 
 
     template <typename T>
     void
     set_linearization_data_slice(T &member, BlockVectorType const &vec) const
     {
-      if constexpr (internal::has_set_data<T, Number>::value)
-        if (nonlinear)
-          {
-            BlockVectorSliceT<Number> v_slice;
-            v_slice.reserve(vec.n_blocks());
-            for (unsigned int v = 0; v < vec.n_blocks(); ++v)
-              v_slice.push_back(vec.block(v));
-            member.set_data(v_slice);
-          }
+      if (nonlinear)
+        {
+          if constexpr (internal::has_set_data<T, Number>::value)
+            {
+              BlockVectorSliceT<Number> v_slice;
+              v_slice.reserve(vec.n_blocks());
+              for (unsigned int v = 0; v < vec.n_blocks(); ++v)
+                v_slice.push_back(vec.block(v));
+              member.set_data(v_slice);
+            }
+          else
+            Assert(false, ExcInternalError());
+        }
     }
 
     mutable BlockVectorType const *solution_linearization;
@@ -520,21 +619,40 @@ namespace dealii
     using BlockVectorType = BlockVectorT<Number>;
     using VectorType      = VectorT<Number>;
 
-    SystemMatrix(TimerOutput              &timer,
-                 const SystemMatrixTypeK  &K,
-                 const SystemMatrixTypeM  &M,
-                 const FullMatrix<Number> &Alpha_,
-                 const FullMatrix<Number> &Beta_)
+    SystemMatrix(
+      TimerOutput              &timer,
+      const SystemMatrixTypeK  &K,
+      const SystemMatrixTypeM  &M,
+      const FullMatrix<Number> &Alpha_,
+      const FullMatrix<Number> &Beta_,
+      BlockSlice                blk_slice_           = {},
+      NonlinearTreatment        nonlinear_treatment_ = NonlinearTreatment::None)
       : SystemMatrixBase<dim, Number, SystemMatrixTypeK, SystemMatrixTypeM>(
           timer,
           K,
           M,
           Alpha_,
-          Beta_)
+          Beta_,
+          blk_slice_,
+          nonlinear_treatment_)
     {}
 
     virtual void
     vmult(BlockVectorType &dst, const BlockVectorType &src) const override
+    {
+      tensorproduct_eval(dst, src, true);
+    }
+
+    virtual void
+    form(BlockVectorType &dst, const BlockVectorType &src) const override
+    {
+      tensorproduct_eval(dst, src, false);
+    }
+
+    void
+    tensorproduct_eval(BlockVectorType       &dst,
+                       const BlockVectorType &src,
+                       bool                   is_vmult) const
     {
       TimerOutput::Scope scope(this->timer, "vmult");
 
@@ -545,13 +663,36 @@ namespace dealii
       this->initialize_spatial_dof_vector(tmp);
       for (unsigned int i = 0; i < n_blocks; ++i)
         {
-          this->K.vmult(tmp, src.block(i));
+          this->set_linearization_data(this->K,
+                                       this->solution_linearization->block(i));
+
+          if constexpr (internal::has_form_vector<SystemMatrixTypeK,
+                                                  Number>::value)
+            {
+              if (is_vmult)
+                this->K.form(tmp, src.block(i));
+              else
+                this->K.vmult(tmp, src.block(i));
+            }
+          else
+            this->K.vmult(tmp, src.block(i));
 
           for (unsigned int j = 0; j < n_blocks; ++j)
             if (this->Alpha(j, i) != 0.0)
               dst.block(j).add(this->Alpha(j, i), tmp);
 
-          this->M.vmult(tmp, src.block(i));
+
+          if constexpr (internal::has_form_vector<SystemMatrixTypeM,
+                                                  Number>::value)
+            {
+              if (is_vmult)
+                this->M.form(tmp, src.block(i));
+              else
+                this->M.vmult(tmp, src.block(i));
+            }
+          else
+            this->M.vmult(tmp, src.block(i));
+
           for (unsigned int j = 0; j < n_blocks; ++j)
             if (this->Beta(j, i) != 0.0)
               dst.block(j).add(this->Beta(j, i), tmp);
@@ -595,7 +736,13 @@ namespace dealii
       this->initialize_spatial_dof_vector(tmp);
       if (!this->alpha_is_zero)
         {
-          this->K.vmult(tmp, src.block(0));
+          this->set_linearization_data_slice(this->K,
+                                             *this->solution_linearization);
+          if constexpr (internal::has_form_vector<SystemMatrixTypeK,
+                                                  Number>::value)
+            this->K.form(tmp, src.block(0));
+          else
+            this->K.vmult(tmp, src.block(0));
           for (unsigned int j = 0; j < n_blocks; ++j)
             if (this->Alpha(j, 0) != 0.0)
               dst.block(j).add(this->Alpha(j, 0), tmp);
@@ -766,7 +913,7 @@ namespace dealii
             // Stokes
             if (!this->alpha_is_zero)
               {
-                this->K.vmult(tmp, src);
+                this->K.form(tmp, src);
                 for (unsigned int v = 0; v < blk_slice.n_variables(); ++v)
                   internal::scatter(
                     dst, tmp, this->Alpha, blk_slice, it, v, id, 0, 0, 0);
@@ -992,7 +1139,7 @@ namespace dealii
         update_values | update_gradients | update_quadrature_points;
       // Right now this is only to avoid errors when the operator is
       // stabilized!
-      if (delta0 != 0.0 || delta1 != 0.0)
+      if (delta0 > 0.0 || delta1 > 0.0)
         additional_data.mapping_update_flags_inner_faces =
           update_values | update_gradients | update_normal_vectors |
           update_quadrature_points;
@@ -1203,8 +1350,12 @@ namespace dealii
       const std::vector<const AffineConstraints<Number> *> &constraints,
       const std::vector<Quadrature<dim>>                   &quadrature,
       const Number                                          viscosity_,
+      Number                                                p_order_,
+      Number                                                p_reg_,
       std::set<types::boundary_id> const &weak_boundary_ids_    = {},
       std::set<types::boundary_id> const &outflow_boundary_ids_ = {},
+      bool                                symmetric_tensor_     = false,
+      bool                                symmetric_nitsche_    = true,
       const Number                        penalty1_             = 20,
       const Number                        penalty2_             = 10,
       const Number                        outflow_penalty_      = 0.0,
@@ -1213,20 +1364,24 @@ namespace dealii
       NonlinearTreatment nonlinear_treatment_ = NonlinearTreatment::None)
       : weak_boundary_ids(weak_boundary_ids_)
       , outflow_boundary_ids(outflow_boundary_ids_)
+      , symmetric_tensor(symmetric_tensor_)
+      , symmetric_nitsche(symmetric_nitsche_)
       , viscosity(viscosity_)
+      , p_order(p_order_)
+      , p_reg(p_reg_)
       , gamma1(viscosity * penalty1_)
       , gamma2(penalty2_)
-      , beta(outflow_penalty_)
+      , outflow_penalty(outflow_penalty_)
       , delta0(delta0_)
-      , delta1(delta1_ == 0 ? 0.01 * delta0_ : delta1_)
+      , delta1(delta1_)
       , data_access_on_faces(
-          delta0 != 0.0 ?
+          (delta0 > 0.0 || delta1 > 0.0) ?
             MatrixFree<dim, Number>::DataAccessOnFaces::gradients :
             MatrixFree<dim, Number>::DataAccessOnFaces::none)
       , nonlinear_treatment(nonlinear_treatment_)
       , nonlinear(nonlinear_treatment != NonlinearTreatment::None)
-      , loop_type(!weak_boundary_ids.empty() || delta0 != 0.0 ? LoopType::Full :
-                                                                LoopType::Cell)
+      , loop_type(!weak_boundary_ids.empty() || delta0 > 0.0 ? LoopType::Full :
+                                                               LoopType::Cell)
     {
       typename MatrixFree<dim, Number>::AdditionalData additional_data;
       internal::set_task_parallel_scheme<dim, Number>(
@@ -1235,7 +1390,7 @@ namespace dealii
       additional_data.mapping_update_flags_boundary_faces =
         update_values | update_gradients | update_normal_vectors |
         update_quadrature_points;
-      if (delta0 != 0.0)
+      if (delta0 > 0.0 || delta1 > 0.0)
         additional_data.mapping_update_flags_inner_faces =
           update_values | update_gradients | update_normal_vectors |
           update_quadrature_points;
@@ -1248,6 +1403,8 @@ namespace dealii
             std::make_unique<FECellIntegratorU>(this->matrix_free, 0);
           velocity_lin_face =
             std::make_unique<FEFaceIntegratorU>(this->matrix_free, true, 0, 0);
+          velocity_lin_face_ex =
+            std::make_unique<FEFaceIntegratorU>(this->matrix_free, false, 0, 0);
         }
     }
 
@@ -1280,7 +1437,7 @@ namespace dealii
     form(BlockVectorType &dst, const BlockVectorType &src) const
     {
       if (!nonlinear)
-        vmult(dst, src);
+        dispatch_loop<OperatorMode::none>(dst, src);
       else
         dispatch_loop<OperatorMode::form>(dst, src);
     }
@@ -1334,6 +1491,7 @@ namespace dealii
     set_data(BlockVectorSliceT<Number> data_slice) const
     {
       Assert(nonlinear, dealii::ExcMessage("not allowed"));
+      Assert(data_slice.size(), dealii::ExcInternalError());
       data_lin = data_slice;
       AssertDimension(data_lin[0].get().size(),
                       matrix_free.get_dof_handler(0).n_dofs());
@@ -1367,15 +1525,31 @@ namespace dealii
               pressure.read_dof_values(p_v);
               velocity.evaluate(EvaluationFlags::gradients);
               pressure.evaluate(EvaluationFlags::values);
-              for (unsigned int q = 0; q < velocity.n_q_points; ++q)
-                {
-                  auto p      = pressure.get_value(q);
-                  auto n      = velocity.get_normal_vector(q);
-                  auto grad_v = velocity.get_gradient(q);
-                  auto tau =
-                    p * n - viscosity * (grad_v + transpose(grad_v)) * n;
-                  velocity.submit_value(tau, q);
-                }
+              if (p_order == 2.0)
+                for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+                  {
+                    auto p      = pressure.get_value(q);
+                    auto n      = velocity.get_normal_vector(q);
+                    auto grad_v = velocity.get_gradient(q);
+                    auto tau =
+                      p * n - viscosity * (grad_v + transpose(grad_v)) * n;
+                    velocity.submit_value(tau, q);
+                  }
+              else
+                for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+                  {
+                    auto       sym_grad_u = velocity.get_symmetric_gradient(q);
+                    auto const p          = pressure.get_value(q);
+                    auto const E          = sym_grad_u.norm();
+                    auto const mu         = std::sqrt(E * E + p_reg * p_reg);
+                    auto const beta =
+                      std::pow(mu, static_cast<Number>(p_order - 2.0));
+                    auto const nu  = 2.0 * beta * viscosity;
+                    auto       n   = velocity.get_normal_vector(q);
+                    auto       tau = p * n - nu * sym_grad_u * n;
+                    velocity.submit_value(tau, q);
+                  }
+
               auto f_local = velocity.integrate_value();
               for (unsigned int d = 0; d < dim; ++d)
                 for (unsigned int n = 0;
@@ -1453,7 +1627,7 @@ namespace dealii
         matrix_free.loop(
           &StokesMatrixFreeOperator::do_cell_integral_range<mode>,
           &StokesMatrixFreeOperator::do_face_integral_range,
-          &StokesMatrixFreeOperator::do_boundary_integral_range,
+          &StokesMatrixFreeOperator::do_boundary_integral_range<mode>,
           this,
           dst,
           src,
@@ -1475,14 +1649,14 @@ namespace dealii
       BlockSparseMatrixType                                &sparse_matrix,
       const std::vector<const AffineConstraints<Number> *> &constraints) const
     {
-      if (!weak_boundary_ids.empty() || delta0 != 0.0)
+      if (!weak_boundary_ids.empty() || delta0 > 0.0)
         MatrixFreeTools::compute_matrix(
           matrix_free,
           constraints,
           sparse_matrix,
           &StokesMatrixFreeOperator::do_cell_integral_local<mode>,
           &StokesMatrixFreeOperator::do_face_integral_local,
-          &StokesMatrixFreeOperator::do_boundary_face_integral_local,
+          &StokesMatrixFreeOperator::do_boundary_face_integral_local<mode>,
           this);
       else
         MatrixFreeTools::compute_matrix(
@@ -1522,10 +1696,24 @@ namespace dealii
         }
     }
 
-    template <OperatorMode op_mode = OperatorMode::none>
+    template <OperatorMode op_mode>
     void
     do_cell_integral_local(FECellIntegratorU &velocity,
                            FECellIntegratorP &pressure) const
+    {
+      if (p_order == 2)
+        do_cell_integral_local_ns<op_mode>(velocity, pressure);
+      else
+        do_cell_integral_local_p_lap<op_mode>(velocity, pressure);
+
+      velocity.integrate(EvaluationFlags::gradients);
+      pressure.integrate(EvaluationFlags::values);
+    }
+
+    template <OperatorMode op_mode>
+    void
+    do_cell_integral_local_ns(FECellIntegratorU &velocity,
+                              FECellIntegratorP &pressure) const
     {
       auto constexpr navier =
         op_mode == OperatorMode::form || op_mode == OperatorMode::jacobian;
@@ -1541,37 +1729,99 @@ namespace dealii
       else
         velocity.evaluate(EvaluationFlags::gradients);
       pressure.evaluate(EvaluationFlags::values);
-
       for (unsigned int q = 0; q < velocity.n_q_points; ++q)
         {
-          auto grad_u = velocity.get_gradient(q);
-          auto div_u  = velocity.get_divergence(q);
-          auto p      = pressure.get_value(q);
-          pressure.submit_value(div_u, q);
+          Tensor<2, dim, VectorizedArray<Number>> grad_u =
+            symmetric_tensor ? velocity.get_symmetric_gradient(q) :
+                               velocity.get_gradient(q);
+          auto const p     = pressure.get_value(q);
+          auto const div_u = trace(grad_u);
           grad_u *= viscosity;
+
           for (unsigned int i = 0; i < dim; ++i)
             grad_u[i][i] -= p;
-          if constexpr (op_mode == OperatorMode::jacobian)
+          if (nonlinear)
             {
-              auto delta_u    = velocity.get_value(q);
-              auto u          = velocity_lin->get_value(q);
-              auto convection = outer_product(u, delta_u);
-              grad_u -= convection;
-              grad_u -= transpose(convection);
+              if constexpr (op_mode == OperatorMode::jacobian)
+                {
+                  auto const delta_u    = velocity.get_value(q);
+                  auto const u          = velocity_lin->get_value(q);
+                  auto const convection = outer_product(u, delta_u);
+                  grad_u -= convection;
+                  grad_u -= transpose(convection);
+                }
+              else if constexpr (op_mode == OperatorMode::form)
+                {
+                  auto const delta_u = velocity.get_value(q);
+                  grad_u -= outer_product(delta_u, delta_u);
+                }
             }
-          else if constexpr (op_mode == OperatorMode::form)
-            {
-              auto u       = velocity_lin->get_value(q);
-              auto delta_u = velocity.get_value(q);
-              grad_u -= outer_product(delta_u, u);
-            }
-          else
-            Assert(!nonlinear, ExcMessage("not implemented"));
+
+          pressure.submit_value(div_u, q);
           velocity.submit_gradient(grad_u, q);
         }
+    }
 
-      velocity.integrate(EvaluationFlags::gradients);
-      pressure.integrate(EvaluationFlags::values);
+    template <OperatorMode op_mode>
+    void
+    do_cell_integral_local_p_lap(FECellIntegratorU &velocity,
+                                 FECellIntegratorP &pressure) const
+    {
+      Assert(symmetric_tensor, ExcInternalError());
+      Assert(velocity_lin, ExcInternalError());
+      velocity_lin->reinit(velocity.get_current_cell_index());
+      velocity_lin->read_dof_values(data_lin[0].get());
+      velocity_lin->evaluate(EvaluationFlags::values |
+                             EvaluationFlags::gradients);
+      velocity.evaluate(EvaluationFlags::values | EvaluationFlags::gradients);
+
+      pressure.evaluate(EvaluationFlags::values);
+      for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+        {
+          auto       sym_grad_u     = velocity.get_symmetric_gradient(q);
+          auto const sym_grad_u_lin = velocity_lin->get_symmetric_gradient(q);
+          auto const p              = pressure.get_value(q);
+          auto const div_u          = trace(sym_grad_u);
+          auto const E              = sym_grad_u_lin.norm();
+          auto const mu             = std::sqrt(E * E + p_reg * p_reg);
+          auto const beta = std::pow(mu, static_cast<Number>(p_order - 2.0));
+          auto const nu   = beta * 2.0 * viscosity;
+
+          if constexpr (op_mode == OperatorMode::jacobian)
+            {
+              auto const sym_grad_delta_u = sym_grad_u;
+              sym_grad_u *= nu;
+              auto const mup4 =
+                std::pow(mu, static_cast<Number>(p_order - 4.0));
+              auto const gamma = (p_order - 2.0) * mup4;
+              sym_grad_u += 2.0 * viscosity * gamma *
+                            scalar_product(sym_grad_u_lin, sym_grad_delta_u) *
+                            sym_grad_u_lin;
+            }
+          else if constexpr (op_mode == OperatorMode::form)
+            sym_grad_u *= nu;
+          else
+            Assert(!nonlinear, ExcMessage("not implemented"));
+
+          for (unsigned int d = 0; d < dim; ++d)
+            sym_grad_u[d][d] -= p;
+
+          Tensor<2, dim, VectorizedArray<Number>> total_grad = sym_grad_u;
+          auto const u       = velocity_lin->get_value(q);
+          auto const delta_u = velocity.get_value(q);
+
+          if constexpr (op_mode == OperatorMode::jacobian)
+            {
+              auto const convection = outer_product(u, delta_u);
+              total_grad -= convection;
+              total_grad -= transpose(convection);
+            }
+          else if constexpr (op_mode == OperatorMode::form)
+            total_grad -= outer_product(delta_u, u);
+
+          pressure.submit_value(div_u, q);
+          velocity.submit_gradient(total_grad, q);
+        }
     }
 
     void
@@ -1611,27 +1861,62 @@ namespace dealii
       FEFaceIntegratorU &u_ex = u.second;
       Assert(u_in.is_interior_face(), ExcInternalError());
       Assert(!u_ex.is_interior_face(), ExcInternalError());
+      auto face_in = u_in.get_cell_or_face_batch_id();
+
+      if (nonlinear)
+        {
+          Assert(velocity_lin_face, ExcInternalError());
+          Assert(velocity_lin_face_ex, ExcInternalError());
+          velocity_lin_face->reinit(face_in);
+          velocity_lin_face->read_dof_values(data_lin[0].get());
+          velocity_lin_face->evaluate(EvaluationFlags::values);
+          velocity_lin_face_ex->reinit(face_in);
+          velocity_lin_face_ex->read_dof_values(data_lin[0].get());
+          velocity_lin_face_ex->evaluate(EvaluationFlags::values);
+        }
+
       auto degree = std::pow(u_in.dofs_per_component, 1.0 / dim) - 1;
       auto pa     = degree * degree * degree * std::sqrt(degree);
 
-      auto face_in = u_in.get_cell_or_face_batch_id();
       u_ex.evaluate(EvaluationFlags::gradients);
       u_in.evaluate(EvaluationFlags::gradients | EvaluationFlags::values);
       for (unsigned int q = 0; q < u_in.n_q_points; ++q)
         {
-          auto normal  = u_in.normal_vector(q);
-          auto u       = u_in.get_value(q);
-          auto delta_K = delta0 * (h[face_in] * h[face_in] / pa) *
-                         (u * normal) * (u * normal);
-          auto jump_grad_u_n =
-            (u_in.get_gradient(q) - u_ex.get_gradient(q)) * normal;
-          u_ex.submit_normal_derivative(-delta_K * jump_grad_u_n, q);
-          u_in.submit_normal_derivative(delta_K * jump_grad_u_n, q);
+          auto const normal = u_in.normal_vector(q);
+          auto const u_i    = velocity_lin_face->get_value(q);
+          auto const u_e    = velocity_lin_face_ex->get_value(q);
+          auto const b      = Number(0.5) * (u_i + u_e);
+          auto const b_n_sq = (b * normal) * (b * normal);
+          auto const w      = (h[face_in] * h[face_in] / pa);
+          auto const delta_conv =
+            delta0 * w * std::sqrt(b_n_sq + 1.e-2 * b.norm_square());
+          auto const delta_full = delta1 * w * b.norm();
+
+          auto const grad_u_i      = u_in.get_gradient(q);
+          auto const grad_u_e      = u_ex.get_gradient(q);
+          auto const jump_grad_u   = grad_u_i - grad_u_e;
+          auto const jump_grad_u_n = jump_grad_u * normal;
+
+          if (delta1 > 0.0)
+            {
+              Tensor<2, dim, VectorizedArray<Number>> G =
+                delta_conv * outer_product(jump_grad_u_n, normal);
+              G += delta_full * jump_grad_u;
+
+              u_in.submit_gradient(G, q);
+              u_ex.submit_gradient(-G, q);
+            }
+          else
+            {
+              u_ex.submit_normal_derivative(-delta_conv * jump_grad_u_n, q);
+              u_in.submit_normal_derivative(delta_conv * jump_grad_u_n, q);
+            }
         }
       u_in.integrate(EvaluationFlags::gradients);
       u_ex.integrate(EvaluationFlags::gradients);
     }
 
+    template <OperatorMode op_mode>
     void
     do_boundary_integral_range(
       const MatrixFree<dim, Number>               &matrix_free,
@@ -1648,23 +1933,101 @@ namespace dealii
           pressure.reinit(face);
           pressure.read_dof_values(src.block(1));
 
-          do_boundary_face_integral_local(velocity, pressure);
+          do_boundary_face_integral_local<op_mode>(velocity, pressure);
 
           velocity.distribute_local_to_global(dst.block(0));
           pressure.distribute_local_to_global(dst.block(1));
         }
     }
 
+    template <OperatorMode op_mode>
     void
     do_boundary_face_integral_local(FEFaceIntegratorU &velocity,
                                     FEFaceIntegratorP &pressure) const
     {
-      auto face      = velocity.get_cell_or_face_batch_id();
-      auto curr_b_id = velocity.boundary_id();
-      auto id        = weak_boundary_ids.find(curr_b_id),
-           o_id      = outflow_boundary_ids.find(curr_b_id);
-      if ((id == weak_boundary_ids.end()) ||
-          (o_id == outflow_boundary_ids.end()))
+      auto const face      = velocity.get_cell_or_face_batch_id();
+      auto const curr_b_id = velocity.boundary_id();
+      auto const id        = weak_boundary_ids.find(curr_b_id);
+      auto const o_id      = outflow_boundary_ids.find(curr_b_id);
+      if (o_id != outflow_boundary_ids.end())
+        {
+          Assert(id == weak_boundary_ids.end(), ExcInternalError());
+          if (nonlinear)
+            {
+              Assert(velocity_lin_face, ExcInternalError());
+              velocity_lin_face->reinit(face);
+              velocity_lin_face->read_dof_values(data_lin[0].get());
+              if (p_order == 2.0)
+                velocity_lin_face->evaluate(EvaluationFlags::values);
+              else
+                velocity_lin_face->evaluate(EvaluationFlags::values |
+                                            EvaluationFlags::gradients);
+            }
+          velocity.evaluate(EvaluationFlags::values |
+                            EvaluationFlags::gradients);
+          pressure.evaluate(EvaluationFlags::values);
+          for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+            {
+              auto const delta_u      = velocity.get_value(q);
+              auto const grad_delta_u = velocity.get_gradient(q);
+              auto const p            = pressure.get_value(q);
+              auto const normal       = velocity.normal_vector(q);
+              Tensor<1, dim, VectorizedArray<Number>> const u =
+                nonlinear ? velocity_lin_face->get_value(q) :
+                            Tensor<1, dim, VectorizedArray<Number>>();
+              auto const sym_grad_u =
+                nonlinear ? velocity_lin_face->get_symmetric_gradient(q) :
+                            SymmetricTensor<2, dim, VectorizedArray<Number>>();
+
+              Tensor<1, dim, VectorizedArray<Number>> dn;
+              VectorizedArray<Number>                 pc = 0.0;
+              Tensor<2, dim, VectorizedArray<Number>> gdn;
+              auto const                              un = u * normal;
+              if constexpr (op_mode == OperatorMode::jacobian)
+                {
+                  dn += delta_u * un + un * delta_u;
+                  // auto const hun = un < VectorizedArray<Number>(0.0);
+                  // dn += -hun * (delta_u * un + un * delta_u);
+                  dn += -std::min(un, VectorizedArray<Number>(0)) * delta_u;
+                }
+              else if constexpr (op_mode == OperatorMode::form)
+                {
+                  dn += delta_u * (normal * delta_u);
+                  dn += -std::min(un, VectorizedArray<Number>(0)) * delta_u;
+                }
+              auto grad_u = grad_delta_u;
+              if (p_order != 2.0)
+                {
+                  auto const E  = sym_grad_u.norm();
+                  auto const mu = std::sqrt(E * E + p_reg * p_reg);
+                  auto const beta =
+                    std::pow(mu, static_cast<Number>(p_order - 2.0));
+                  auto const nu = beta * viscosity;
+                  grad_u *= nu;
+                }
+              else
+                grad_u *= viscosity;
+              for (unsigned int d = 0; d < dim; ++d)
+                grad_u[d][d] -= p;
+              dn += grad_u * normal;
+              velocity.submit_value(dn, q);
+              velocity.submit_gradient(gdn, q);
+              pressure.submit_value(pc, q);
+            }
+        }
+      else if (id != weak_boundary_ids.end())
+        {
+          Assert(o_id == outflow_boundary_ids.end(), ExcInternalError());
+          if (p_order == 2.0)
+            do_boundary_face_integral_local_ns<op_mode>(face,
+                                                        velocity,
+                                                        pressure);
+          else
+            do_boundary_face_integral_local_p_lap<op_mode>(face,
+                                                           velocity,
+                                                           pressure);
+        }
+      else
         {
           std::fill_n(velocity.begin_values(),
                       velocity.n_q_points * velocity.n_components,
@@ -1677,88 +2040,161 @@ namespace dealii
                       pressure.n_q_points * pressure.n_components,
                       Number(0.0));
         }
-      if (o_id != outflow_boundary_ids.end())
+
+      if (symmetric_nitsche)
+        velocity.integrate(EvaluationFlags::values |
+                           EvaluationFlags::gradients);
+      else
+        velocity.integrate(EvaluationFlags::values);
+      pressure.integrate(EvaluationFlags::values);
+    }
+
+
+    template <OperatorMode op_mode>
+    void
+    do_boundary_face_integral_local_p_lap(unsigned int       face,
+                                          FEFaceIntegratorU &velocity,
+                                          FEFaceIntegratorP &pressure) const
+    {
+      if (nonlinear)
         {
           Assert(velocity_lin, ExcInternalError());
-          if (nonlinear)
-            {
-              velocity_lin_face->reinit(face);
-              velocity_lin_face->read_dof_values(data_lin[0].get());
-              velocity_lin_face->evaluate(EvaluationFlags::values);
-            }
-          velocity.evaluate(EvaluationFlags::values |
-                            EvaluationFlags::gradients);
-          pressure.evaluate(EvaluationFlags::values);
-          for (unsigned int q = 0; q < velocity.n_q_points; ++q)
-            {
-              auto grad_u = velocity.get_gradient(q);
-              auto normal = velocity.normal_vector(q);
-              auto b      = nonlinear ? velocity_lin_face->get_value(q) :
-                                        Tensor<1, dim, VectorizedArray<Number>>();
-              // according to Bertoglio & Caiazzo
-              auto grad_u_t = grad_u - outer_product(grad_u * normal, normal);
-              auto bfp      = 0.0 * 0.5 * h[face] * h[face] *
-                         std::min(b * normal, VectorizedArray<Number>(0)) *
-                         grad_u_t;
-              velocity.submit_gradient(bfp, q);
-              // Not strictly neccessary? - but it also doesn't hurt
-              auto dn = nonlinear ?
-                          -0.5 * beta *
-                            outer_product(b, velocity.get_value(q)) * normal :
-                          Tensor<1, dim, VectorizedArray<Number>>();
-              velocity.submit_value(dn, q);
-            }
-          std::fill_n(pressure.begin_values(),
-                      pressure.n_q_points * pressure.n_components,
-                      Number(0.0));
+          velocity_lin_face->reinit(face);
+          velocity_lin_face->read_dof_values(data_lin[0].get());
+          if (p_order == 2.0)
+            velocity_lin_face->evaluate(EvaluationFlags::values);
+          else
+            velocity_lin_face->evaluate(EvaluationFlags::values |
+                                        EvaluationFlags::gradients);
         }
-      else if (id != weak_boundary_ids.end())
+      auto degree = std::pow(velocity.dofs_per_component, 1.0 / dim) - 1;
+      auto pa     = degree * degree;
+
+      velocity.evaluate(EvaluationFlags::values | EvaluationFlags::gradients);
+      pressure.evaluate(EvaluationFlags::values);
+      for (unsigned int q = 0; q < velocity.n_q_points; ++q)
         {
-          if (nonlinear)
-            {
-              Assert(velocity_lin, ExcInternalError());
-              velocity_lin_face->reinit(face);
-              velocity_lin_face->read_dof_values(data_lin[0].get());
-              velocity_lin_face->evaluate(EvaluationFlags::values);
-            }
-          velocity.evaluate(EvaluationFlags::values |
-                            EvaluationFlags::gradients);
-          pressure.evaluate(EvaluationFlags::values);
-          for (unsigned int q = 0; q < velocity.n_q_points; ++q)
-            {
-              auto normal = velocity.normal_vector(q);
-              auto grad_u = velocity.get_gradient(q);
-              auto u      = velocity.get_value(q);
+          auto const normal = velocity.normal_vector(q);
+          auto const u      = velocity.get_value(q);
+          auto const p      = pressure.get_value(q);
+          auto const sym_grad_u_lin =
+            velocity_lin_face->get_symmetric_gradient(q);
+          auto const sym_grad_delta_u = velocity.get_symmetric_gradient(q);
+          auto const E                = sym_grad_u_lin.norm();
+          auto const mu               = std::sqrt(E * E + p_reg * p_reg);
+          auto const beta = std::pow(mu, static_cast<Number>(p_order - 2.0));
+          auto const nu   = beta * 2.0 * viscosity;
 
-              auto p = pressure.get_value(q);
+          Tensor<1, dim, VectorizedArray<Number>> nitsche_1;
 
-              auto nitsche_u_1 = -viscosity * grad_u * normal + p * normal +
-                                 (gamma1 / h[face]) * u +
-                                 (gamma2 / h[face]) * normal * (u * normal);
-              if (nonlinear)
-                {
-                  auto b = velocity_lin_face->get_value(q);
-                  nitsche_u_1 -=
-                    std::min(b * normal, VectorizedArray<Number>(0)) * u;
-                }
-              velocity.submit_value(nitsche_u_1, q);
-              velocity.submit_normal_derivative(-viscosity * u, q);
-              pressure.submit_value(-u * normal, q);
+          if constexpr (op_mode == OperatorMode::jacobian)
+            {
+              auto const mup4 =
+                std::pow(mu, static_cast<Number>(p_order - 4.0));
+              auto const gamma = (p_order - 2.0) * mup4;
+              auto const flux  = nu * sym_grad_delta_u;
+              auto const b     = velocity_lin_face->get_value(q);
+              auto const bn    = b * normal;
+              nitsche_1        = -flux * normal -
+                          2.0 * viscosity * gamma *
+                            (sym_grad_u_lin * sym_grad_delta_u) * normal *
+                            sym_grad_u_lin +
+                          p * normal + (pa * gamma1 / h[face]) * u +
+                          (pa * gamma2 / h[face]) * normal * (u * normal);
+              nitsche_1 += bn * u + (u * normal) * b;
+              // auto const hun = bn < VectorizedArray<Number>(0.0);
+              // nitsche_1 += -hun * (bn * u + (u * normal) * b);
+              nitsche_1 -= std::min(b * normal, VectorizedArray<Number>(0)) * u;
             }
+          else if constexpr (op_mode == OperatorMode::form ||
+                             op_mode == OperatorMode::none)
+            {
+              auto const flux = nu * sym_grad_delta_u;
+              auto const b    = velocity_lin_face->get_value(q);
+
+              nitsche_1 = -flux * normal + p * normal +
+                          (pa * gamma1 / h[face]) * u +
+                          (pa * gamma2 / h[face]) * normal * (u * normal);
+              nitsche_1 += (b * normal) * u;
+              nitsche_1 -= std::min(b * normal, VectorizedArray<Number>(0)) * u;
+            }
+          else
+            Assert(!nonlinear, ExcMessage("not implemented"));
+          auto const nitsche_2 = nu * u;
+
+          velocity.submit_value(nitsche_1, q);
+          if (symmetric_nitsche)
+            velocity.submit_normal_derivative(-nitsche_2, q);
+          pressure.submit_value(-u * normal, q);
         }
-      velocity.integrate(EvaluationFlags::values | EvaluationFlags::gradients);
-      pressure.integrate(EvaluationFlags::values);
+    }
+
+    template <OperatorMode op_mode>
+    void
+    do_boundary_face_integral_local_ns(unsigned int       face,
+                                       FEFaceIntegratorU &velocity,
+                                       FEFaceIntegratorP &pressure) const
+    {
+      Assert(!symmetric_tensor, ExcInternalError());
+      if (nonlinear)
+        {
+          Assert(velocity_lin, ExcInternalError());
+          velocity_lin_face->reinit(face);
+          velocity_lin_face->read_dof_values(data_lin[0].get());
+          velocity_lin_face->evaluate(EvaluationFlags::values);
+        }
+      velocity.evaluate(EvaluationFlags::values | EvaluationFlags::gradients);
+      pressure.evaluate(EvaluationFlags::values);
+      auto degree = std::pow(velocity.dofs_per_component, 1.0 / dim) - 1;
+      auto pa     = degree * degree;
+
+      for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+        {
+          auto const normal = velocity.normal_vector(q);
+          auto const u      = velocity.get_value(q);
+          auto const p      = pressure.get_value(q);
+          Tensor<1, dim, VectorizedArray<Number>> const u_lin =
+            nonlinear ? velocity_lin_face->get_value(q) :
+                        Tensor<1, dim, VectorizedArray<Number>>();
+
+          auto nitsche_1 = -viscosity * velocity.get_gradient(q) * normal +
+                           p * normal + (pa * gamma1 / h[face]) * u +
+                           (pa * gamma2 / h[face]) * normal * (u * normal);
+          if constexpr (op_mode == OperatorMode::jacobian)
+            {
+              nitsche_1 += (u_lin * normal) * u + (u * normal) * u_lin;
+              nitsche_1 -=
+                std::min(u * normal, VectorizedArray<Number>(0)) * u_lin;
+            }
+          else if constexpr (op_mode == OperatorMode::form)
+            {
+              nitsche_1 += (u * normal) * u;
+              nitsche_1 -=
+                std::min(u * normal, VectorizedArray<Number>(0)) * u_lin;
+            }
+
+          velocity.submit_value(nitsche_1, q);
+          if (symmetric_nitsche)
+            velocity.submit_normal_derivative(-viscosity * u, q);
+          pressure.submit_value(-u * normal, q);
+        }
     }
 
     MatrixFree<dim, Number>                    matrix_free;
     mutable std::unique_ptr<FECellIntegratorU> velocity_lin;
     mutable std::unique_ptr<FEFaceIntegratorU> velocity_lin_face;
+    mutable std::unique_ptr<FEFaceIntegratorU> velocity_lin_face_ex;
     mutable BlockVectorSliceT<Number>          data_lin;
     std::set<types::boundary_id>               weak_boundary_ids{};
     std::set<types::boundary_id>               outflow_boundary_ids{};
-    Number                                     viscosity = 1.0;
+    bool                                       symmetric_tensor  = false;
+    bool                                       symmetric_nitsche = true;
+    Number                                     viscosity         = 1.0;
+    Number                                     p_order;
+    Number                                     p_reg;
     AlignedVector<VectorizedArray<Number>>     h;
-    Number gamma1 = 20, gamma2 = 10, beta = 0.0, delta0 = 0.0, delta1 = 0.0;
+    Number gamma1 = 20, gamma2 = 10, outflow_penalty = 0.0, delta0 = 0.0,
+           delta1 = 0.0;
     typename MatrixFree<dim, Number>::DataAccessOnFaces data_access_on_faces;
     NonlinearTreatment                                  nonlinear_treatment;
     bool                                                nonlinear;
@@ -1778,12 +2214,22 @@ namespace dealii
       const std::vector<const AffineConstraints<Number> *> &constraints,
       const std::vector<Quadrature<dim>>                   &quadrature,
       const Number                                          viscosity_,
+      Number                                                p_order_,
+      Number                                                p_reg_,
+      bool                                                  symmetric_tensor_,
+      bool                                                  symmetric_nitsche_,
       const Number                                          penalty1_,
       const Number                                          penalty2_,
+      const Number                                          outflow_penalty_,
       const bool                                            is_nonlinear)
       : viscosity(viscosity_)
+      , p_order(p_order_)
+      , p_reg(p_reg_)
+      , symmetric_tensor(symmetric_tensor_)
+      , symmetric_nitsche(symmetric_nitsche_)
       , gamma1(viscosity * penalty1_)
       , gamma2(penalty2_)
+      , outflow_penalty(outflow_penalty_)
       , nonlinear(is_nonlinear)
     {
       typename MatrixFree<dim, Number>::AdditionalData additional_data;
@@ -1893,7 +2339,6 @@ namespace dealii
       std::pair<FEFaceIntegratorU &, FEFaceIntegratorU &> const &,
       std::pair<FEFaceIntegratorP &, FEFaceIntegratorP &> const &) const
     {}
-
     void
     do_boundary_integral_range(
       const MatrixFree<dim, Number> &matrix_free,
@@ -1906,47 +2351,91 @@ namespace dealii
       for (unsigned int face = range.first; face < range.second; ++face)
         {
           velocity.reinit(face);
-          std::vector<DirichletValue<dim, dim, Number>> dv;
-          if (auto g = dirichlet_color_to_fun->find(velocity.boundary_id());
+          auto const curr_b_id = velocity.boundary_id();
+          if (auto g = dirichlet_color_to_fun->find(curr_b_id);
               g != dirichlet_color_to_fun->end())
             {
-              dv.resize(velocity.n_q_points);
-              for (unsigned int q = 0; q < velocity.n_q_points; ++q)
-                internal::set_vector(dv[q],
-                                     velocity.quadrature_point(q),
-                                     *(g->second));
-            }
-          else
-            continue;
+              auto degree =
+                std::pow(velocity.dofs_per_component, 1.0 / dim) - 1;
+              auto pa = degree * degree;
 
-          pressure.reinit(face);
-          for (unsigned int q = 0; q < velocity.n_q_points; ++q)
-            {
-              auto        normal      = velocity.normal_vector(q);
-              auto const &g           = dv[q];
-              auto        nitsche_u_1 = (gamma1 / h[face]) * g +
-                                 (gamma2 / h[face]) * normal * (g * normal);
-              if (nonlinear)
-                nitsche_u_1 -=
-                  std::min(g * normal, VectorizedArray<Number>(0)) * g;
-              velocity.submit_value(nitsche_u_1, q);
-              velocity.submit_normal_derivative(-viscosity * g, q);
-              pressure.submit_value(-g * normal, q);
+              std::vector<DirichletValue<dim, dim, Number>>    dv;
+              std::vector<DirichletGradient<dim, dim, Number>> dv_grad;
+              dv.resize(velocity.n_q_points);
+              dv_grad.resize(velocity.n_q_points);
+              for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+                {
+                  internal::set_vector(dv[q],
+                                       velocity.quadrature_point(q),
+                                       *(g->second));
+                  internal::set_vector_gradient(dv_grad[q],
+                                                velocity.quadrature_point(q),
+                                                *(g->second));
+                }
+
+              pressure.reinit(face);
+              if (p_order != 2.0)
+                for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+                  {
+                    auto        normal = velocity.normal_vector(q);
+                    auto const &g      = dv[q];
+                    SymmetricTensor<2, dim, VectorizedArray<Number>>
+                               sym_g_grad = symmetrize(dv_grad[q]);
+                    auto const E          = sym_g_grad.norm();
+                    auto const mu         = std::sqrt(E * E + p_reg * p_reg);
+                    auto const beta =
+                      std::pow(mu, static_cast<Number>(p_order - 2.0));
+                    auto const nu = beta * 2.0 * viscosity;
+
+                    auto nitsche_1 =
+                      (pa * gamma1 / h[face]) * g +
+                      (pa * gamma2 / h[face]) * normal * (g * normal);
+                    auto nitsche_2 = nu * g;
+                    nitsche_1 -=
+                      std::min(g * normal, VectorizedArray<Number>(0)) * g;
+                    velocity.submit_value(nitsche_1, q);
+                    if (symmetric_nitsche)
+                      velocity.submit_normal_derivative(-nitsche_2, q);
+                    pressure.submit_value(-g * normal, q);
+                  }
+              else
+                for (unsigned int q = 0; q < velocity.n_q_points; ++q)
+                  {
+                    auto        normal = velocity.normal_vector(q);
+                    auto const &g      = dv[q];
+                    auto        nitsche_1 =
+                      (pa * gamma1 / h[face]) * g +
+                      (pa * gamma2 / h[face]) * normal * (g * normal);
+                    // nitsche_1 -=
+                    //   std::min(g * normal, VectorizedArray<Number>(0)) * g;
+                    velocity.submit_value(nitsche_1, q);
+                    if (symmetric_nitsche)
+                      velocity.submit_normal_derivative(-viscosity * g, q);
+                    pressure.submit_value(-g * normal, q);
+                  }
+
+              if (symmetric_nitsche)
+                velocity.integrate(EvaluationFlags::values |
+                                   EvaluationFlags::gradients);
+              else
+                velocity.integrate(EvaluationFlags::values);
+              pressure.integrate(EvaluationFlags::values);
+              velocity.distribute_local_to_global(dst.block(0));
+              pressure.distribute_local_to_global(dst.block(1));
             }
-          velocity.integrate(EvaluationFlags::values |
-                             EvaluationFlags::gradients);
-          pressure.integrate(EvaluationFlags::values);
-          velocity.distribute_local_to_global(dst.block(0));
-          pressure.distribute_local_to_global(dst.block(1));
         }
     }
 
     mutable std::map<types::boundary_id, Function<dim, Number> *> const
-                                          *dirichlet_color_to_fun = nullptr;
-    MatrixFree<dim, Number>                matrix_free;
-    Number                                 viscosity = 1.0;
-    Number                                 gamma1 = 20, gamma2 = 10;
-    bool                                   nonlinear;
+                           *dirichlet_color_to_fun = nullptr;
+    MatrixFree<dim, Number> matrix_free;
+    Number                  viscosity = 1.0;
+    Number                  p_order;
+    Number                  p_reg;
+    bool                    symmetric_tensor  = false;
+    bool                    symmetric_nitsche = true;
+    Number                  gamma1 = 20, gamma2 = 10, outflow_penalty = 0.0;
+    bool                    nonlinear;
     AlignedVector<VectorizedArray<Number>> h;
   };
 
@@ -2006,9 +2495,8 @@ namespace dealii
     void
     residual(BlockVectorType &dst, BlockVectorType const &src) const
     {
-      form(dst, src);
-      dst *= -1.0;
-      dst.add(1.0, *this->rhs);
+      this->form(dst, src);
+      dst.sadd(-1.0, 1.0, *this->rhs);
     }
 
     /// Evaluation of weak form.
@@ -2099,7 +2587,6 @@ namespace dealii
                                         Number,
                                         MatrixFreeOperatorScalar<dim, Number>,
                                         MatrixFreeOperatorScalar<dim, Number>>>;
-
   template <typename Number>
   void
   boundary_values_map_to_constraints(

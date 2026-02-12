@@ -45,13 +45,18 @@ test(dealii::ConditionalOStream &pcout,
   std::visit([&](auto &p) { p.parse(file_name); }, parameters);
   ConvergenceTable table;
   ConvergenceTable itable;
+  ConvergenceTable ntable;
+  ConvergenceTable wtable;
 
   auto convergence_test = [&]<int dim>(int const              refinement,
                                        int const              fe_degree,
                                        Parameters<dim> const &parameters) {
     stokes::Parameters stokes_parameters;
+    NewtonData         newton_parameters;
     if (parameters.additional_file != "")
       stokes_parameters.parse(parameters.additional_file);
+    if (parameters.newton_data_file != "")
+      newton_parameters.parse(parameters.newton_data_file);
 
     const bool print_timing      = parameters.print_timing;
     const bool space_time_mg     = parameters.space_time_mg;
@@ -85,7 +90,9 @@ test(dealii::ConditionalOStream &pcout,
     else
       fe_p = std::make_unique<FE_Q<dim>>(fe_degree);
 
-    auto                         n_q_p = fe_u.tensor_degree() + 1u;
+    auto                         n_q_p = parameters.is_nonlinear ?
+                                           fe_u.tensor_degree() + 1u :
+                                           2u * (fe_u.tensor_degree() + 1u) / 2u;
     QGauss<dim>                  quad_u(n_q_p);
     QGauss<dim>                  quad_p(fe_p->tensor_degree() + 1);
     std::vector<Quadrature<dim>> quads{quad_u, quad_p};
@@ -101,11 +108,15 @@ test(dealii::ConditionalOStream &pcout,
 
     double time     = 0.;
     double time_len = parameters.end_time - time;
-    double step_ = std::min(GridTools::minimal_cell_diameter(tria), time_len);
+    double step_ =
+      std::min(GridTools::minimal_cell_diameter(tria) / std::sqrt(dim),
+               time_len);
     Assert(numbers::is_finite(time_len) && time_len > 0, ExcInternalError());
-    unsigned int n_steps        = static_cast<unsigned int>(time_len / step_);
-    int          t_refinement   = refinement + 1;
-    double       time_step_size = time_len * pow(2.0, -t_refinement) / n_steps;
+    unsigned int n_steps =
+      std::max(static_cast<unsigned int>((time_len) / step_), 1u);
+    int    t_refinement   = refinement + parameters.time_refine_offset;
+    double time_step_size = time_len * pow(2.0, -t_refinement) / n_steps;
+    AssertIsFinite(time_step_size);
 
     double viscosity = stokes_parameters.viscosity;
     tria.refine_global(refinement);
@@ -122,8 +133,15 @@ test(dealii::ConditionalOStream &pcout,
     auto [d, d_map] =
       get_dirichlet_function<Number>(parameters, stokes_parameters);
     if (parameters.nitsche_boundary)
-      for (auto const &[id, g] : d_map)
-        weak_boundary_ids.insert(id);
+      {
+        pcout << "Dirichlet on id: ";
+        for (auto const &[id, g] : d_map)
+          {
+            pcout << id << " ";
+            weak_boundary_ids.insert(id);
+          }
+        pcout << std::endl;
+      }
 
     dealii::AffineConstraints<Number>                      constraints_u;
     dealii::AffineConstraints<Number>                      constraints_p;
@@ -179,13 +197,18 @@ test(dealii::ConditionalOStream &pcout,
       constraints,
       quads_u,
       viscosity,
+      stokes_parameters.p_order,
+      stokes_parameters.p_regularization,
       weak_boundary_ids,
       outflow_boundary_ids,
+      stokes_parameters.symmetric_tensor,
+      parameters.symmetric_nitsche,
       stokes_parameters.penalty1,
       stokes_parameters.penalty2,
       stokes_parameters.outflow_penalty,
       stokes_parameters.delta0,
-      stokes_parameters.delta1);
+      stokes_parameters.delta1,
+      parameters.nonlinear_treatment);
     using Nitsche = StokesNitscheMatrixFreeOperator<dim, Number>;
     std::unique_ptr<Nitsche> Stokes_nitsche_mf =
       std::make_unique<Nitsche>(mapping,
@@ -193,8 +216,13 @@ test(dealii::ConditionalOStream &pcout,
                                 constraints,
                                 quads_u,
                                 viscosity,
+                                stokes_parameters.p_order,
+                                stokes_parameters.p_regularization,
+                                stokes_parameters.symmetric_tensor,
+                                parameters.symmetric_nitsche,
                                 stokes_parameters.penalty1,
                                 stokes_parameters.penalty2,
+                                stokes_parameters.outflow_penalty,
                                 parameters.is_nonlinear);
 
     MatrixFreeOperatorVector<dim, Number> M_mf(mapping,
@@ -244,10 +272,20 @@ test(dealii::ConditionalOStream &pcout,
     FullMatrix<Number> const rhs_uK = is_cgp ? Gamma : zero;
     FullMatrix<Number> const rhs_uM = is_cgp ? Zeta : Gamma;
 
-    matrix = std::make_unique<SystemN>(
-      timer, Stokes_mf, M_mf, lhs_uK, lhs_uM, blk_slice);
-    rhs_matrix = std::make_unique<SystemN>(
-      timer, Stokes_mf, M_mf, rhs_uK, rhs_uM, blk_slice);
+    matrix     = std::make_unique<SystemN>(timer,
+                                       Stokes_mf,
+                                       M_mf,
+                                       lhs_uK,
+                                       lhs_uM,
+                                       blk_slice,
+                                       parameters.nonlinear_treatment);
+    rhs_matrix = std::make_unique<SystemN>(timer,
+                                           Stokes_mf,
+                                           M_mf,
+                                           rhs_uK,
+                                           rhs_uM,
+                                           blk_slice,
+                                           parameters.nonlinear_treatment);
 
 #ifdef MATRIX_BASED
     auto sparsity_pattern =
@@ -465,9 +503,11 @@ test(dealii::ConditionalOStream &pcout,
       evaluate_numerical_solution(1, time, tmp, x, prev_x, blk_offset);
     };
 
-    BlockVectorType                        x, rhs, residual;
+    BlockVectorType                        x, x_lin, rhs, residual;
     LinearAlgebra::ReadWriteVector<Number> cell_vector(tria.n_active_cells());
     matrix->initialize_dof_vector(x);
+    if (parameters.is_nonlinear)
+      matrix->initialize_dof_vector(x_lin);
     // interpolate initial value
     evaluate_exact_solution_u(
       0, x.block(blk_slice.index(n_timesteps_at_once - 1, 0, nt_dofs - 1)));
@@ -510,6 +550,8 @@ test(dealii::ConditionalOStream &pcout,
       mg_empty_constraints(min_level, max_level);
     MGLevelObject<BlockVectorT<NumberPreconditioner>> mg_solution_vector(
       min_level, max_level);
+    MGLevelObject<BlockVectorT<NumberPreconditioner>> mg_mean_vector(min_level,
+                                                                     max_level);
     MGLevelObject<BlockVectorSliceT<NumberPreconditioner>> mg_slice_vector(
       min_level, max_level);
 #ifdef MATRIX_BASED
@@ -566,7 +608,9 @@ test(dealii::ConditionalOStream &pcout,
         auto const &fe_p_ = *(*fe_)[1];
         auto const &fe_u_ = *(*fe_)[0];
         AssertDimension(fe_u_.tensor_degree() - 1, fe_p_.tensor_degree());
-        auto                         n_q_p_ = fe_u_.tensor_degree() + 1u;
+        auto                         n_q_p_ = parameters.is_nonlinear ?
+                                                fe_u_.tensor_degree() + 1u :
+                                                3u * (fe_u_.tensor_degree() + 1u) / 2u;
         QGauss<dim>                  quad_u_(n_q_p_);
         std::vector<Quadrature<dim>> quads_u_{quad_u_, quad_u_};
         dof_handler_p_->distribute_dofs(fe_p_);
@@ -614,13 +658,18 @@ test(dealii::ConditionalOStream &pcout,
             mg_constraints[l],
             quads_u_,
             viscosity,
+            stokes_parameters.p_order,
+            stokes_parameters.p_regularization,
             weak_boundary_ids,
             outflow_boundary_ids,
+            stokes_parameters.symmetric_tensor,
+            parameters.symmetric_nitsche,
             stokes_parameters.penalty1,
             stokes_parameters.penalty2,
             stokes_parameters.outflow_penalty,
             stokes_parameters.delta0,
-            stokes_parameters.delta1);
+            stokes_parameters.delta1,
+            parameters.nonlinear_treatment);
         auto M_mf_ =
           std::make_shared<MatrixFreeOperatorVector<dim, NumberPreconditioner>>(
             mapping,
@@ -652,6 +701,13 @@ test(dealii::ConditionalOStream &pcout,
                                                     *empty_constraints_p);
             empty_constraints_u->close();
             empty_constraints_p->close();
+            if (parameters.is_nonlinear)
+              {
+                mg_empty_constraints_u[l] = empty_constraints_u;
+                mg_empty_constraints_p[l] = empty_constraints_p;
+                mg_empty_constraints[l]   = {empty_constraints_u.get(),
+                                             empty_constraints_p.get()};
+              }
             auto sparsity_pattern =
               stokes::get_sparsity_pattern(*dof_handler_u_,
                                            *dof_handler_p_,
@@ -665,6 +721,13 @@ test(dealii::ConditionalOStream &pcout,
             // create Stokes matrix
             Stokes->reinit(*sparsity_pattern);
             BlockVectorT<NumberPreconditioner> mg_x;
+            if (parameters.is_nonlinear)
+              {
+                Stokes_mf_->initialize_dof_vector(mg_x);
+                BlockVectorSliceT<NumberPreconditioner> mg_x_{
+                  std::cref(mg_x.block(0)), std::cref(mg_x.block(1))};
+                Stokes_mf_->set_data(std::move(mg_x_));
+              }
             Stokes_mf_->compute_system_matrix(
               *Stokes,
               std::vector<
@@ -710,6 +773,12 @@ test(dealii::ConditionalOStream &pcout,
                   }
               }
 #endif
+            if (parameters.is_nonlinear)
+              {
+                mg_stokes_operators[l] = Stokes;
+                mg_mass_operators[l]   = M;
+              }
+
             if (p_seq[i] != 0)
               precondition_vanka[l] =
                 std::make_shared<PreconditionVanka<NumberPreconditioner>>(
@@ -736,9 +805,17 @@ test(dealii::ConditionalOStream &pcout,
         mg_operators[l]        = std::make_shared<SystemNP_M>(
           timer, *Stokes, M->block(0, 0), lhs_uK_p, lhs_uM_p, blk_indices[i]);
 #else
-        mg_operators[l] = std::make_shared<SystemNP>(
-          timer, *Stokes_mf_, *M_mf_, lhs_uK_p, lhs_uM_p, blk_indices[i]);
+        mg_operators[l] =
+          std::make_shared<SystemNP>(timer,
+                                     *Stokes_mf_,
+                                     *M_mf_,
+                                     lhs_uK_p,
+                                     lhs_uM_p,
+                                     blk_indices[i],
+                                     parameters.nonlinear_treatment);
 #endif
+        if (parameters.is_nonlinear)
+          mg_operators[l]->initialize_dof_vector(mg_solution_vector[l]);
       }
     if (parameters.use_pmg)
       Assert(fe_ == fe_pmg.end() - 1, ExcInternalError());
@@ -750,6 +827,12 @@ test(dealii::ConditionalOStream &pcout,
         matrix->initialize_dof_vector(*tmp1);
         matrix->initialize_dof_vector(*tmp2);
       }
+    size_t total_smoother_nnz = 0;
+    for (unsigned int l = min_level; l <= max_level; ++l)
+      if (precondition_vanka[l])
+        total_smoother_nnz += precondition_vanka[l]->nnz();
+
+    pcout << "Total NNZ " << total_smoother_nnz << std::endl << std::endl;
 #ifdef MATRIX_BASED
     using Preconditioner = GMG<dim, Number, SystemNP_M>;
 #else
@@ -854,34 +937,109 @@ test(dealii::ConditionalOStream &pcout,
     StokesOperator<dim, Number> sm;
     sm.init(*matrix, rhs);
 
-    auto step =
-      std::make_unique<TimeIntegratorFO<dim,
-                                        Number,
-                                        Preconditioner,
-                                        StokesOperator<dim, Number>,
-                                        SystemN,
-                                        Nitsche>>(parameters.type,
-                                                  fe_degree,
-                                                  Alpha_1,
-                                                  Gamma_1,
-                                                  parameters.rel_tol,
-                                                  sm,
-                                                  *preconditioner,
-                                                  *rhs_matrix,
-                                                  integrate_rhs_function_,
-                                                  n_timesteps_at_once,
-                                                  parameters.extrapolate,
-                                                  *Stokes_nitsche_mf,
-                                                  st_convergence ? 1.e-12 :
-                                                                   1.e-10);
+    auto step = std::make_unique<TimeIntegratorFO<dim,
+                                                  Number,
+                                                  Preconditioner,
+                                                  StokesOperator<dim, Number>,
+                                                  SystemN,
+                                                  Nitsche>>(
+      parameters.type,
+      fe_degree,
+      Alpha_1,
+      Gamma_1,
+      parameters.rel_tol,
+      sm,
+      *preconditioner,
+      *rhs_matrix,
+      integrate_rhs_function_,
+      n_timesteps_at_once,
+      parameters.extrapolate,
+      *Stokes_nitsche_mf,
+      parameters.nonlinear_treatment,
+      st_convergence ? 1.e-12 : 1.e-10);
     if (parameters.nitsche_boundary)
       for (auto [b_id, g] : d_map)
         step->add_dirichlet_function(0, b_id, g);
 
+    if (parameters.is_nonlinear)
+      step->update_linearization_user =
+        [&parameters,
+         &is_cgp,
+         &x_lin,
+         &mg_solution_vector,
+         &mg_slice_vector,
+         &mg_mean_vector,
+         &matrix,
+         &preconditioner,
+         &mg_operators,
+         &blk_indices](BlockVectorType const &) {
+          matrix->set_data(x_lin);
+          mg_solution_vector[mg_solution_vector.max_level()]
+            .copy_locally_owned_data_from(x_lin);
+
+          mg_operators[mg_solution_vector.max_level()]->set_data(
+            mg_solution_vector[mg_solution_vector.max_level()]);
+
+          for (int l = static_cast<int>(mg_solution_vector.max_level()) - 1;
+               l >= static_cast<int>(mg_solution_vector.min_level());
+               --l)
+            {
+              preconditioner->interpolate(l + 1,
+                                          mg_solution_vector[l],
+                                          mg_solution_vector[l + 1]);
+              mg_operators[l]->set_data(mg_solution_vector[l]);
+            }
+
+          for (unsigned int l = mg_solution_vector.min_level(), i = 0;
+               l <= mg_solution_vector.max_level();
+               ++l, ++i)
+            {
+              get_linear_combination(
+                mg_mean_vector[l],
+                blk_indices[i],
+                get_time_quad(parameters.type, blk_indices[i].n_timedofs() - 1)
+                  .get_weights(),
+                mg_solution_vector[l]);
+              mg_slice_vector[l] = copy_blocks(mg_mean_vector[l]);
+            }
+        };
+    if (parameters.is_nonlinear)
+      step->update_preconditioner_user = [&timer,
+                                          &precondition_vanka,
+                                          &mg_dof_handlers,
+                                          &mg_stokes_operators,
+                                          &mg_mass_operators,
+                                          &mg_Stokes_mf,
+                                          &mg_M_mf,
+                                          &mg_empty_constraints,
+                                          &fetw,
+                                          &newton_parameters,
+                                          &p_seq,
+                                          &K_mask,
+                                          &M_mask,
+                                          &mg_slice_vector]() {
+        TimerOutput::Scope scope(timer, "Update Preconditioner");
+        if (newton_parameters.do_update)
+          reinit_asm(precondition_vanka,
+                     mg_dof_handlers,
+                     mg_stokes_operators,
+                     mg_mass_operators,
+                     mg_Stokes_mf,
+                     mg_M_mf,
+                     mg_empty_constraints,
+                     fetw,
+                     p_seq,
+                     K_mask,
+                     M_mask,
+                     mg_slice_vector);
+      };
+    if (parameters.nonlinear_treatment == NonlinearTreatment::Implicit)
+      step->setup_nonlinear(newton_parameters);
+
     double           l2 = 0., l8 = -1., h1_semi = 0., hdiv_semi = 0.;
     double           l2_p = 0., l8_p = -1., h1_semi_p = 0.;
     constexpr double qNaN = std::numeric_limits<double>::quiet_NaN();
-    int              i = 0, total_gmres_iterations = 0;
+    int i = 0, total_gmres_iterations = 0, total_newton_iterations = 0;
 
     unsigned int samples_per_interval = (fe_degree + 1) * (fe_degree + 1);
     double       sample_step          = 1.0 / (samples_per_interval - 1);
@@ -976,13 +1134,13 @@ test(dealii::ConditionalOStream &pcout,
               for (unsigned int row = 0; row < output_pt_eval_res.m(); ++row)
                 {
                   double t_ = time + time_step_size * (it + row * sample_step);
-                  file << std::setw(16) << std::scientific << t_;
+                  file << std::setw(12) << std::scientific << t_;
                   for (unsigned int c = 0; c < output_pt_eval_res.n(); ++c)
-                    file << std::setw(16) << std::scientific << " "
+                    file << std::setw(12) << std::scientific << " "
                          << output_pt_eval_res(row, c);
                   for (unsigned int c = 0; c < output_functional_eval_res.n();
                        ++c)
-                    file << std::setw(16) << std::scientific << " "
+                    file << std::setw(12) << std::scientific << " "
                          << output_functional_eval_res(row, c);
                   file << '\n';
                 }
@@ -998,18 +1156,34 @@ test(dealii::ConditionalOStream &pcout,
     };
     auto const data_output =
       [&](VectorType const &v, VectorType const &p, std::string const &name) {
-        DataOut<dim> data_out;
+        DataOut<dim>                  data_out;
+        dealii::DataOutBase::VtkFlags flags(time, timestep_number);
+        if (parameters.do_higher_order_output)
+          flags.write_higher_order_cells = true;
         static const std::vector<
           dealii::DataComponentInterpretation::DataComponentInterpretation>
           dci(dim,
               dealii::DataComponentInterpretation::component_is_part_of_vector);
         data_out.add_data_vector(dof_handler_u, v, "u", dci);
         data_out.add_data_vector(dof_handler_p, p, "p");
-        data_out.build_patches();
-        data_out.set_flags(DataOutBase::VtkFlags(time, timestep_number));
+        data_out.set_flags(flags);
+        if (parameters.do_higher_order_output)
+          data_out.build_patches(mapping, fe_u.tensor_degree());
+        else
+          data_out.build_patches();
         data_out.write_vtu_with_pvtu_record(
           "./", name, timestep_number, tria.get_communicator(), 4);
       };
+
+    FullMatrix<Number> extrapolation;
+    if (parameters.is_nonlinear)
+      extrapolation =
+        get_extrapolation_matrix<Number>(parameters.type,
+                                         parameters.nonlinear_extrapolation,
+                                         fe_degree,
+                                         1.0,
+                                         0.0,
+                                         0.0);
 
     while (time < parameters.end_time)
       {
@@ -1018,6 +1192,9 @@ test(dealii::ConditionalOStream &pcout,
         ++timestep_number;
         dealii::deallog << "Step " << timestep_number << " t = " << time
                         << std::endl;
+        if (parameters.is_nonlinear)
+          extrapolate_nonlinear(x_lin, extrapolation, blk_slice, x, prev_x);
+
         equ(prev_x,
             blk_slice.get_variable(x, n_timesteps_at_once - 1, nt_dofs - 1));
         if (!parameters.nitsche_boundary)
@@ -1036,6 +1213,7 @@ test(dealii::ConditionalOStream &pcout,
         step->solve(x, prev_x, rhs, timestep_number, time, time_step_size);
 
         total_gmres_iterations += step->last_step();
+        total_newton_iterations += step->nonlinear_steps();
 
         for (unsigned int v = 0; v < 2; ++v)
           {
@@ -1117,24 +1295,28 @@ test(dealii::ConditionalOStream &pcout,
 #endif
       }
     double average_gmres_iter = static_cast<double>(total_gmres_iterations) /
-                                static_cast<double>(timestep_number);
-    pcout << "Average GMRES iterations " << average_gmres_iter << " ("
-          << total_gmres_iterations << " gmres_iterations / " << timestep_number
-          << " timesteps)\n"
-          << std::endl;
+                                static_cast<double>(total_newton_iterations);
+    double average_newton_iter = static_cast<double>(total_newton_iterations) /
+                                 static_cast<double>(timestep_number);
+    pcout << "⌀ GMRES " << average_gmres_iter << " ⌀ Newton "
+          << average_newton_iter << " (" << total_gmres_iterations
+          << " total gmres iter. | " << timestep_number << " timesteps | "
+          << total_newton_iterations << " Newton iter.)" << std::endl;
     if (print_timing)
       timer.print_wall_time_statistics(MPI_COMM_WORLD);
 
     auto const   n_active_cells = tria.n_global_active_cells();
-    size_t const n_dofs  = static_cast<size_t>(dof_handlers[0]->n_dofs() +
+    size_t const n_dofs        = static_cast<size_t>(dof_handlers[0]->n_dofs() +
                                               dof_handlers[1]->n_dofs());
-    size_t const st_dofs = i * n_dofs * n_blocks;
-    size_t const work    = n_dofs * n_blocks * total_gmres_iterations;
+    size_t const st_dofs       = i * n_dofs * n_blocks;
+    size_t const work          = n_dofs * n_blocks * total_gmres_iterations;
+    size_t const smoother_work = total_smoother_nnz * total_gmres_iterations;
     table.add_value("cells", n_active_cells);
     table.add_value("s-dofs", n_dofs);
     table.add_value("t-dofs", n_blocks);
     table.add_value("st-dofs", st_dofs);
     table.add_value("work", work);
+    table.add_value("smoother-work", smoother_work);
     table.add_value("L\u221E-L\u221E(u)", st_convergence ? l8 : qNaN);
     table.add_value("L2-L2(u)", st_convergence ? std::sqrt(l2) : qNaN);
     table.add_value("L2-H1_semi(u)",
@@ -1146,6 +1328,8 @@ test(dealii::ConditionalOStream &pcout,
     table.add_value("L2-H1_semi(p)",
                     st_convergence ? std::sqrt(h1_semi_p) : qNaN);
     itable.add_value(std::to_string(refinement), average_gmres_iter);
+    ntable.add_value(std::to_string(refinement), average_newton_iter);
+    wtable.add_value(std::to_string(refinement), total_smoother_nnz);
   };
   auto const [k, d_cyc, r_cyc, r] = std::visit(
     [](auto const &p) {
@@ -1159,6 +1343,8 @@ test(dealii::ConditionalOStream &pcout,
   for (unsigned int j = k; j < k + d_cyc; ++j)
     {
       itable.add_value("k \\ r", j);
+      ntable.add_value("k \\ r", j);
+      wtable.add_value("k \\ r", j);
       for (unsigned int i = r; i < r + r_cyc; ++i)
         if (dim == 2)
           convergence_test(i, j, std::get<Parameters<2>>(parameters));
@@ -1200,7 +1386,11 @@ test(dealii::ConditionalOStream &pcout,
     }
   pcout << "Iteration count table\n";
   if (pcout.is_active())
-    itable.write_text(pcout.get_stream());
+    {
+      itable.write_text(pcout.get_stream());
+      ntable.write_text(pcout.get_stream());
+      wtable.write_text(pcout.get_stream());
+    }
   pcout << std::endl;
 }
 

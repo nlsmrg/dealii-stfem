@@ -127,10 +127,16 @@ enum class NonlinearExtrapolation : unsigned int
   LeastSquares = 3,
 };
 
+enum class LineSearchStrategy
+{
+  fixed_factor,
+  linear_decrease
+};
+
 enum class PatchType
 {
   element,
-  vertex_star,
+  vertex_star
 };
 
 static std::unordered_map<std::string, ProblemType> const str_to_problem_type =
@@ -180,6 +186,10 @@ static std::unordered_map<std::string, NonlinearExtrapolation> const
     {"polynomial", NonlinearExtrapolation::Polynomial},
     {"leastSquares", NonlinearExtrapolation::LeastSquares}};
 
+static std::unordered_map<std::string, LineSearchStrategy> const
+  str_to_ls_strategy = {{"fixedFactor", LineSearchStrategy::fixed_factor},
+                        {"linearDecrease",
+                         LineSearchStrategy::linear_decrease}};
 
 static std::unordered_map<std::string, PatchType> const str_to_patch_type =
   {{"element", PatchType::element}, {"vertexStar", PatchType::vertex_star}};

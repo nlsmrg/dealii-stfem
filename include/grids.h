@@ -95,9 +95,20 @@ namespace dealii
               }
             else
               {
-                ret.first.emplace_back(
-                  std::make_unique<stokes::LidDriven<dim, Number>>(
-                    stokes_parameters));
+                if (stokes_parameters.lid_driven_bc == 1)
+                  ret.first.emplace_back(
+                    std::make_unique<stokes::LidDriven<dim, Number>>(
+                      stokes_parameters));
+                else if (stokes_parameters.lid_driven_bc == 2)
+                  ret.first.emplace_back(
+                    std::make_unique<
+                      stokes::LidDrivenDiscontinuous<dim, Number>>(
+                      stokes_parameters));
+                else if (stokes_parameters.lid_driven_bc == 3)
+                  ret.first.emplace_back(
+                    std::make_unique<stokes::LidDrivenSawTooth<dim, Number>>(
+                      stokes_parameters));
+
                 ret.second.emplace(1, ret.first.back().get());
                 return ret;
               }

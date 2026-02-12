@@ -660,7 +660,6 @@ namespace dealii
            const Table<2, bool> &M_mask          = Table<2, bool>(),
            bool                  element_centric = true)
     {
-      this->clear();
       AssertDimension(SPB->n_block_rows(), dof_handler.size());
       std::vector<IndexSet> locally_relevant_dofs(SPB->n_block_rows());
       BlockVectorType       valence(SPB->n_block_rows());
@@ -676,29 +675,39 @@ namespace dealii
 
       indices.resize(SPB->n_block_rows());
       if (element_centric)
-        for (unsigned int i = 0; i < dof_handler.size(); ++i)
-          for (const auto &cell : dof_handler[i]->active_cell_iterators())
-            {
+        for (unsigned v = 0; v < dof_handler.size(); ++v)
+          {
+            const auto    &dh            = *dof_handler[v];
+            const unsigned dofs_per_cell = dh.get_fe().n_dofs_per_cell();
+            unsigned       n_patches     = 0;
+            for (const auto &cell : dh.active_cell_iterators())
+              if (cell->is_locally_owned())
+                ++n_patches;
+
+            indices[v].resize(n_patches);
+            unsigned k = 0;
+            for (const auto &cell : dh.active_cell_iterators())
               if (cell->is_locally_owned())
                 {
-                  std::vector<types::global_dof_index> local_to_global(
-                    cell->get_fe().n_dofs_per_cell());
-                  cell->get_dof_indices(local_to_global);
-                  for (auto const &dof_index : local_to_global)
-                    valence.block(i)[dof_index] += static_cast<Number>(1);
-
-                  indices[i].emplace_back(local_to_global);
+                  auto &vec = indices[v][k];
+                  vec.resize(dofs_per_cell);
+                  cell->get_dof_indices(vec);
+                  for (auto gid : vec)
+                    valence.block(v)[gid] += static_cast<Number>(1);
+                  ++k;
                 }
-            }
+          }
       else
         {
+          indices.clear();
+          indices.resize(SPB->n_block_rows());
           const auto &triangulation = dof_handler[0]->get_triangulation();
           auto vertex_patch_map = GridTools::vertex_to_cell_map(triangulation);
 
           for (unsigned int v = 0; v < vertex_patch_map.size(); ++v)
             {
-              const Point<dim> vertex_point = triangulation.get_vertices()[v];
-              auto            &vertex_patch = vertex_patch_map[v];
+              auto &vertex_patch = vertex_patch_map[v];
+
               for (unsigned int i = 0; i < dof_handler.size(); ++i)
                 {
                   auto &fe = dof_handler[i]->get_fe();
@@ -716,34 +725,30 @@ namespace dealii
                         for (unsigned int d = 0; d < fe.n_dofs_per_cell(); ++d)
                           {
                             bool exclude = false;
-                            if (i != 0) // Stokes specific!
-                              {
-                                auto gp =
-                                  fe.get_associated_geometry_primitive(d);
-                                if (dim == 2 && gp == GeometryPrimitive::quad)
-                                  exclude = false;
-                                else if (dim == 3 &&
-                                         gp == GeometryPrimitive::hex)
-                                  exclude = false;
-                                else
-                                  for (auto f : cell->face_indices())
-                                    {
-                                      if (!fe.has_support_on_face(f, d))
-                                        continue;
 
-                                      const auto face      = cell->face(f);
-                                      bool       touches_v = false;
-                                      for (auto fv : face->vertex_indices())
-                                        if (face->vertex_index(fv) == v)
-                                          {
-                                            touches_v = true;
-                                            break;
-                                          }
+                            auto gp = fe.get_associated_geometry_primitive(d);
+                            if (dim == 2 && gp == GeometryPrimitive::quad)
+                              exclude = false;
+                            else if (dim == 3 && gp == GeometryPrimitive::hex)
+                              exclude = false;
+                            else
+                              for (auto f : cell->face_indices())
+                                {
+                                  if (!fe.has_support_on_face(f, d))
+                                    continue;
 
-                                      if (!touches_v)
-                                        exclude = true;
-                                    }
-                              }
+                                  const auto face      = cell->face(f);
+                                  bool       touches_v = false;
+                                  for (auto fv : face->vertex_indices())
+                                    if (face->vertex_index(fv) == v)
+                                      {
+                                        touches_v = true;
+                                        break;
+                                      }
+
+                                  if (!touches_v)
+                                    exclude = true;
+                                }
                             if (!exclude)
                               patch_indices.push_back(local_to_global[d]);
                           }
@@ -802,14 +807,15 @@ namespace dealii
             n_sd += indices[i][ii].size();
           auto &B = blocks[ii];
           B.reinit(n_sd * td, n_sd * td);
+          max_block_size = std::max(max_block_size, B.m());
           if (B.empty())
             continue;
           for (unsigned int i = 0, r_o = 0; i < blk_slice.n_blocks(); ++i)
             {
-              auto const &[it, iv, id] = blk_slice.decompose(i);
+              auto const iv = blk_slice.decompose(i)[1];
               for (unsigned int j = 0, c_o = 0; j < blk_slice.n_blocks(); ++j)
                 {
-                  auto const &[jt, jv, jd] = blk_slice.decompose(j);
+                  auto const jv = blk_slice.decompose(j)[1];
                   if (Beta(i, j) != 0.0 && (M_mask.empty() || M_mask(iv, jv)))
                     {
                       const auto &M = M_blocks(iv, jv)[ii];
@@ -860,7 +866,7 @@ namespace dealii
            std::shared_ptr<const DoFHandler<dim>> const  &dof_handler,
            bool element_centric = true)
     {
-      this->clear();
+      indices.clear();
       std::vector<FullMatrix<Number>> K_blocks, M_blocks;
       IndexSet                        locally_relevant_dofs;
       DoFTools::extract_locally_relevant_dofs(*dof_handler,
@@ -893,8 +899,7 @@ namespace dealii
 
           for (unsigned int v = 0; v < vertex_patch_map.size(); ++v)
             {
-              const Point<dim> vertex_point = triangulation.get_vertices()[v];
-              auto            &vertex_patch = vertex_patch_map[v];
+              auto &vertex_patch = vertex_patch_map[v];
 
               auto                                &fe = dof_handler->get_fe();
               std::vector<types::global_dof_index> patch_indices;
@@ -912,8 +917,9 @@ namespace dealii
                         bool exclude = false;
 
                         auto gp = fe.get_associated_geometry_primitive(d);
-                        if ((dim == 2 && gp == GeometryPrimitive::quad) ||
-                            (dim == 3 && gp == GeometryPrimitive::hex))
+                        if (dim == 2 && gp == GeometryPrimitive::quad)
+                          exclude = false;
+                        else if (dim == 3 && gp == GeometryPrimitive::hex)
                           exclude = false;
                         else
                           for (auto f : cell->face_indices())
@@ -933,7 +939,6 @@ namespace dealii
                               if (!touches_v)
                                 exclude = true;
                             }
-
                         if (!exclude)
                           patch_indices.push_back(local_to_global[d]);
                       }
@@ -975,6 +980,7 @@ namespace dealii
           auto       &B = blocks[ii];
 
           B.reinit(K.m() * Alpha.m(), K.n() * Alpha.n());
+          max_block_size = std::max(max_block_size, B.m());
 
           for (unsigned int i = 0; i < Alpha.m(); ++i)
             for (unsigned int j = 0; j < Alpha.n(); ++j)
@@ -995,8 +1001,11 @@ namespace dealii
 
       dst = 0.0;
 
-      Vector<Number>     dst_local;
-      Vector<Number>     src_local;
+      Vector<Number> dst_local;
+      Vector<Number> src_local;
+      dst_local.reinit(max_block_size);
+      src_local.reinit(max_block_size);
+
       const unsigned int n_blocks = src.n_blocks();
       for (unsigned int i = 0; i < n_blocks; ++i)
         src.block(i).update_ghost_values();
@@ -1004,14 +1013,14 @@ namespace dealii
       for (unsigned int i = 0; i < blocks.size(); ++i)
         {
           // gather
-          src_local.reinit(blocks[i].m());
-          dst_local.reinit(blocks[i].m());
+          src_local.reinit(blocks[i].m(), true);
+          dst_local.reinit(blocks[i].m(), true);
 
           for (unsigned int b = 0, c = 0; b < n_blocks; ++b)
             {
-              auto const &[tsp, v, td] = blk_slice.decompose(b);
-              for (unsigned int j = 0; j < indices[v][i].size(); ++j, ++c)
-                src_local[c] = src.block(b)[indices[v][i][j]];
+              auto const &indicesvi = indices[blk_slice.decompose(b)[1]][i];
+              for (unsigned int j = 0; j < indicesvi.size(); ++j, ++c)
+                src_local[c] = src.block(b)[indicesvi[j]];
             }
           // patch solver
           blocks[i].vmult(dst_local, src_local);
@@ -1019,9 +1028,9 @@ namespace dealii
           // scatter
           for (unsigned int b = 0, c = 0; b < n_blocks; ++b)
             {
-              auto const &[tsp, v, td] = blk_slice.decompose(b);
-              for (unsigned int j = 0; j < indices[v][i].size(); ++j, ++c)
-                dst.block(b)[indices[v][i][j]] += dst_local[c];
+              auto const &indicesvi = indices[blk_slice.decompose(b)[1]][i];
+              for (unsigned int j = 0; j < indicesvi.size(); ++j, ++c)
+                dst.block(b)[indicesvi[j]] += dst_local[c];
             }
         }
 
@@ -1069,6 +1078,7 @@ namespace dealii
     BlockSlice                                                     blk_slice;
     std::vector<std::vector<std::vector<types::global_dof_index>>> indices;
     std::vector<FullMatrix<Number>>                                blocks;
+    typename FullMatrix<Number>::size_type max_block_size = 0;
 
     bool                                            build_cache = false;
     std::shared_ptr<const SparsityPatternType>      SP;
@@ -1134,6 +1144,62 @@ namespace dealii
                                         M_mask);
         }
   }
+
+  template <int dim,
+            typename Number,
+            typename SpaceMatrixFreeOperator,
+            typename TimeMatrixFreeOperator>
+  void
+  reinit_asm(
+    MGLevelObject<std::shared_ptr<PreconditionVanka<Number>>>
+      &precondition_vanka,
+    MGLevelObject<std::shared_ptr<const DoFHandler<dim>>> const
+                                                     &mg_dof_handlers,
+    MGLevelObject<std::shared_ptr<SparseMatrixType>> &mg_space_operators,
+    MGLevelObject<std::shared_ptr<SparseMatrixType>> &mg_time_operators,
+    MGLevelObject<std::shared_ptr<const SpaceMatrixFreeOperator>> const
+      &mg_space_operators_mf,
+    MGLevelObject<std::shared_ptr<const TimeMatrixFreeOperator>> const &,
+    MGLevelObject<std::shared_ptr<const AffineConstraints<Number>>> const
+                                                         &mg_empty_constraints,
+    std::vector<std::array<FullMatrix<Number>, 4>> const &fetw,
+    std::vector<unsigned int> const                      &p_seq,
+    MGLevelObject<BlockVectorSliceT<Number>> const       &mg_data = {})
+  {
+    auto min_level = precondition_vanka.min_level();
+    auto max_level = precondition_vanka.max_level();
+    if constexpr (internal::has_set_data<SpaceMatrixFreeOperator,
+                                         Number>::value)
+      {
+        AssertDimension(min_level, mg_data.min_level());
+        AssertDimension(max_level, mg_data.max_level());
+      }
+
+    for (unsigned int l = min_level, i = 0; l <= max_level; ++l, ++i)
+      if (p_seq[i] != 0)
+        {
+          auto const &lhs_uK_p = fetw[l][0];
+          auto const &lhs_uM_p = fetw[l][1];
+          // create Stokes matrix
+          auto &space_operator = mg_space_operators[l];
+          *space_operator      = 0.0;
+
+          auto const &space_operator_mf = mg_space_operators_mf[l];
+          if constexpr (internal::has_set_data<SpaceMatrixFreeOperator,
+                                               Number>::value)
+            space_operator_mf->set_data(mg_data[l]);
+
+          space_operator_mf->compute_system_matrix(*space_operator);
+
+          auto &time_operator = mg_time_operators[l];
+          precondition_vanka[l]->reinit(space_operator,
+                                        time_operator,
+                                        lhs_uK_p,
+                                        lhs_uM_p,
+                                        mg_dof_handlers[l]);
+        }
+  }
+
 
   template <typename Number, typename PreconType1, typename PreconType2>
   class PreconditionSTMG

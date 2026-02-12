@@ -20,6 +20,7 @@ SET( TARGET_SRC dummy.cc
   include/operators.cc
   include/parameters.cc
   include/stokes.cc
+  include/newton.cc
 )
 INCLUDE_DIRECTORIES(include)
 

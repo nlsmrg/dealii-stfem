@@ -25,7 +25,7 @@ def generate_slurm_script(args):
 #SBATCH --output={base_filename}.log # log file which will contain all output
 
 # commands to be executed
-srun  --mpi=pmix {args.executable} --file {args.param} --dim {args.dim}"""
+srun  --mpi=pmix {args.executable} --file {args.param} --dim {args.dim} --log_prefix {base_filename}"""
     if args.precon_float:
         script_content += " --precondition_float 1"
 

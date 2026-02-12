@@ -16,6 +16,9 @@ namespace dealii::stokes
     double       characteristic_diameter = 0.1;
     double       u_mean                  = 1.0;
     double       viscosity               = 1.0;
+    double       p_order                 = 2.0;
+    double       p_regularization        = 1.e-3;
+    bool         symmetric_tensor        = false;
     double       delta0                  = 0.0;
     double       delta1                  = 0.0;
     double       penalty1                = 20;
@@ -25,7 +28,7 @@ namespace dealii::stokes
     bool         dg_pressure             = true;
     unsigned int dfg_benchmark           = 0;
     double       height                  = 0.41;
-
+    unsigned int lid_driven_bc           = 1;
 
     void
     parse(const std::string file_name);
@@ -64,17 +67,132 @@ namespace dealii::stokes
       return 0.;
     }
 
+    Tensor<1, dim, Number>
+    gradient(const Point<dim>  &x,
+             const unsigned int component) const override final
+    {
+      Tensor<1, dim, Number> g;
+      if (component != 0)
+        return g;
+      using numbers::PI;
+      const double t = this->get_time();
+      const double factor =
+        is_dfg3 ? std::sin(PI * t / 8.0) :
+                  ((t < 1.0 / dirichlet_factor) ?
+                     0.5 - 0.5 * std::cos(dirichlet_factor * PI * t) :
+                     1.0);
+      if constexpr (dim == 3)
+        {
+          const double C = 16.0 * u_max * factor / std::pow(0.41, 4);
+          const double y = x(1);
+          const double z = x(2);
+          g[0]           = Number(0.0);
+          g[1]           = Number(C * z * (z - 0.41) * (2.0 * y - 0.41));
+          g[2]           = Number(C * y * (y - 0.41) * (2.0 * z - 0.41));
+        }
+      else // dim == 2
+        {
+          const double C = 4.0 * u_max * factor / std::pow(0.41, 2);
+          const double y = x(1);
+          g[0]           = Number(0.0);
+          g[1]           = Number(C * (0.41 - 2.0 * y));
+        }
+
+      return g;
+    }
+
+
   private:
     bool   is_dfg3;
     double u_max;
   };
 
+
   template <int dim, typename Number>
-  struct LidDriven : public Function<dim, Number>
+  struct LidDriven : public dealii::Function<dim, Number>
   {
-    LidDriven(stokes::Parameters const &stokes_parameters)
-      : Function<dim, Number>(dim)
+    LidDriven(stokes::Parameters const &stokes_parameters,
+              Number                    y_min_ = Number(0),
+              Number                    y_max_ = Number(1),
+              Number                    z_min_ = Number(0),
+              Number                    z_max_ = Number(1),
+              Number                    delta_ = Number(0.05))
+      : dealii::Function<dim, Number>(dim)
       , is_time_dependent(stokes_parameters.dfg_benchmark == 0)
+      , u_max(stokes_parameters.u_mean)
+      , y_min(y_min_)
+      , y_max(y_max_)
+      , z_min(z_min_)
+      , z_max(z_max_)
+      , delta(std::max(Number(0), std::min(delta_, Number(0.49))))
+    {}
+
+    Number
+    value(const dealii::Point<dim> &p,
+          unsigned int const        component) const override final
+    {
+      using dealii::numbers::PI;
+
+      if (component != 1)
+        return Number(0);
+
+      const Number t = this->get_time();
+      const Number factor =
+        is_time_dependent ?
+          std::sin(PI * t / Number(4.0)) :
+          ((t < Number(1.0) / dirichlet_factor) ?
+             Number(0.5) - Number(0.5) * std::cos(dirichlet_factor * PI * t) :
+             Number(1.0));
+
+      Number w = corner_window_1d(normalize01(p[1], y_min, y_max));
+      if constexpr (dim == 3)
+        w *= corner_window_1d(normalize01(p[2], z_min, z_max));
+
+      return factor * u_max * w;
+    }
+
+    dealii::Tensor<1, dim, Number>
+    gradient(const dealii::Point<dim> &,
+             const unsigned int /*component*/) const override final
+    {
+      return {};
+    }
+
+  private:
+    static Number
+    normalize01(Number x, Number a, Number b)
+    {
+      return (b != a) ? std::clamp((x - a) / (b - a), Number(0), Number(1)) :
+                        Number(0.5);
+    }
+
+    Number
+    corner_window_1d(Number s) const
+    {
+      using dealii::numbers::PI;
+      const Number d = delta;
+      if (d <= Number(0))
+        return Number(1);
+      if (s < d)
+        return Number(0.5) * (1 - std::cos(PI * (s / d)));
+      if (s > Number(1) - d)
+        return Number(0.5) * (1 - std::cos(PI * ((Number(1) - s) / d)));
+      return Number(1);
+    }
+
+    bool   is_time_dependent;
+    Number u_max;
+    Number y_min, y_max, z_min, z_max;
+    Number delta;
+
+    static constexpr Number dirichlet_factor = Number(1.0);
+  };
+
+  template <int dim, typename Number>
+  struct LidDrivenDiscontinuous : public Function<dim, Number>
+  {
+    LidDrivenDiscontinuous(stokes::Parameters const &stokes_parameters)
+      : Function<dim, Number>(dim)
       , u_max(stokes_parameters.u_mean)
     {}
 
@@ -82,21 +200,52 @@ namespace dealii::stokes
     value(Point<dim> const &, unsigned int const component) const override final
     {
       using dealii::numbers::PI;
-      auto       t      = this->get_time();
-      auto const factor = is_time_dependent ?
-                            sin(PI * t / 4.0) :
-                            ((t < 1. / dirichlet_factor) ?
-                               0.5 - 0.5 * cos(dirichlet_factor * PI * t) :
-                               1.0);
-      if (component == 1)
-        return factor * u_max;
-      return 0.;
+      if (component != 1)
+        return 0.;
+      return ((this->get_time() < 4) ? u_max : -u_max);
+    }
+
+    Tensor<1, dim, Number>
+    gradient(const Point<dim> &,
+             const unsigned int /*component*/) const override final
+    {
+      Tensor<1, dim, Number> g;
+      return g;
     }
 
   private:
-    bool   is_time_dependent;
     double u_max;
   };
+
+  template <int dim, typename Number>
+  struct LidDrivenSawTooth : public Function<dim, Number>
+  {
+    LidDrivenSawTooth(stokes::Parameters const &stokes_parameters)
+      : Function<dim, Number>(dim)
+      , u_max(stokes_parameters.u_mean)
+    {}
+
+    Number
+    value(Point<dim> const &, unsigned int const component) const override final
+    {
+      using dealii::numbers::PI;
+      if (component != 1)
+        return 0.;
+      return 0.5 * u_max * std::fmod(this->get_time(), 4.0) - u_max;
+    }
+
+    Tensor<1, dim, Number>
+    gradient(const Point<dim> &,
+             const unsigned int /*component*/) const override final
+    {
+      Tensor<1, dim, Number> g;
+      return g;
+    }
+
+  private:
+    double u_max;
+  };
+
 
   template <int dim, typename Number>
   auto
@@ -131,7 +280,7 @@ namespace dealii::stokes
                              dof_handler_u_.get_communicator());
 
     // Create the block sparsity pattern for each block
-    if (with_convection_stabilization)
+    if (!with_convection_stabilization)
       DoFTools::make_block_sparsity_pattern_block(dof_handler_u_,
                                                   dof_handler_u_,
                                                   sparsity_pattern->block(0, 0),

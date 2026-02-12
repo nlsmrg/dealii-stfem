@@ -16,8 +16,8 @@
     "usePMg"                 : "true",
     "coarseningType"         : "space_and_time",
     "spaceTimeLevelFirst"    : "false",
-    "nDegCycles"             : "4",
-    "nRefCycles"             : "4",
+    "nDegCycles"             : "6",
+    "nRefCycles"             : "6",
     "frequency"              : "1.0",
     "extrapolate"            : "true",
     "refinement"             : "1",
@@ -25,5 +25,8 @@
     "smoothingRange"         : "5.0",
     "coarseGridMaxiter"      : "10",
     "pMgType"                : "bisect",
+		"nonlinearTreatment"     : "implicit",
+		"nonlinearExtrapolation" : "constant",
+		"newtonDataFile"         : "tests/json/newton.json",
     "additionalFile"         : "tests/json/stokes.json"
 }

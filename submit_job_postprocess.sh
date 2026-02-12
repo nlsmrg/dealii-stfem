@@ -34,7 +34,7 @@ submit_job() {
     awk '/^Iteration count table/ { print_it = 1 } print_it { if (/^[a-zA-Z]/) print "#" $0; else print $0 } /^$/ { print_it = 0 }' "${script_base_name}.log" > "$output_dir/iteration_tables.txt"
     mv solution*.pvtu "$output_dir"
     mv solution*.vtu "$output_dir"
-    mv proc*.log "$output_dir"
+    mv "${script_base_name}*.log" "$output_dir"
     mv functionals.txt "$output_dir"
     mv "${script_base_name}_params.json" "$output_dir"
 }

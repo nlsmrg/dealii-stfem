@@ -1,7 +1,11 @@
 {
     "computeDragLift"        : "false",
     "meanPressure"           : "true",
-    "viscosity"              : "1.0",
+    "viscosity"              : "0.0001",
     "dfgBenchmark"           : "0",
-    "dGPressure"             : "true"
+    "dGPressure"             : "true",
+    "delta0" : 0.0,
+    "delta1" : 0.0,
+    "penalty1"               : "0.0",
+    "penalty2"               : "0.0"
 }

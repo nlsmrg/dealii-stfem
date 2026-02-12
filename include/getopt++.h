@@ -23,7 +23,7 @@ namespace util
     static constexpr int none     = 0; /** enable/disable things, e.g. help */
     static constexpr int required = 1; /** argument for setting variables */
     static constexpr int optional = 2; /** unclear */
-  }                                    // namespace arg_type
+  } // namespace arg_type
   using option_map_ = std::map<char, std::any>;
   using option_map  = std::shared_ptr<option_map_>;
 
@@ -196,11 +196,8 @@ namespace util
     bool                           help_on_destruct{false};
     const int                      argc_{0};
     char                         **argv_;
-    static constexpr struct option null_opt
-    {
-      nullptr, 0, nullptr, 0
-    };
-    option_map config;
+    static constexpr struct option null_opt{nullptr, 0, nullptr, 0};
+    option_map                     config;
   };
 
   cl_options::~cl_options()
@@ -241,10 +238,7 @@ namespace util
         char *lo = new char[long_opt.size() + 1];
         std::copy(long_opt.begin(), long_opt.end(), lo);
         lo[long_opt.size()] = '\0';
-        const struct option opt
-        {
-          lo, ha, NULL, short_opt
-        };
+        const struct option opt{lo, ha, NULL, short_opt};
         options.emplace_back(opt);
         searchstring += short_opt;
         if (config)

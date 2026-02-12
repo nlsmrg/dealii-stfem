@@ -86,8 +86,8 @@ namespace dealii
           auto       &cell_matrix           = blocks[c];
 
           // allocate memory
-          const unsigned int n_local_rows = row_indices[c].size();
-          const unsigned int n_local_cols = col_indices[c].size();
+          const unsigned int n_local_rows = local_dof_row_indices.size();
+          const unsigned int n_local_cols = local_dof_col_indices.size();
 
           cell_matrix = FullMatrix<Number>(n_local_rows, n_local_cols);
 
@@ -201,7 +201,14 @@ namespace dealii
                                          scaling,
                                          mask,
                                          cache);
-      blocks.resize(blocks_(0, 0).size());
+
+      unsigned int n_blocks;
+      for (unsigned int iv = 0; iv < mask.size(0); ++iv)
+        for (unsigned int jv = 0; jv < mask.size(1); ++jv)
+          if ((mask.empty() || mask(iv, jv)))
+            n_blocks = blocks_(iv, jv).size();
+
+      blocks.resize(n_blocks);
       for (unsigned int ii = 0; ii < blocks.size(); ++ii)
         {
           auto        &block  = blocks[ii];

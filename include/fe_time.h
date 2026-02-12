@@ -325,6 +325,27 @@ namespace dealii
     return time_evaluator;
   }
 
+  template <typename Number>
+  FullMatrix<Number>
+  get_time_evaluation_matrix(
+    std::vector<Polynomials::Polynomial<double>> const &basis,
+    std::vector<Point<1>>                               points)
+  {
+    FullMatrix<Number> time_evaluator(points.size(), basis.size());
+    for (unsigned int s = 0; s < points.size(); ++s)
+      {
+        double time_ = points[s][0];
+        auto   te    = time_evaluator.begin(s);
+        for (auto const &el : basis)
+          {
+            *te = el.value(time_);
+            ++te;
+          }
+      }
+    return time_evaluator;
+  }
+
+
   /** Generates the time integration weights for time continuous
    * Galerkin-Petrov discretizations or time discontinuous Galerkin
    * discretizations
@@ -1140,6 +1161,37 @@ namespace dealii
       return result;
     }
 
+
+    template <typename Number>
+    BlockVectorSliceT<Number>
+    get_time(const BlockVectorT<Number> &block_vector,
+             const VectorT<Number>      &prev_vector) const
+    {
+      AssertDimension(1, this->n_variables());
+      BlockVectorSliceT<Number> result;
+      std::vector<unsigned int> indices = get_time(0);
+      result.reserve(indices.size() + 1);
+      result.push_back(std::cref(prev_vector));
+      auto result_ = get_slice(block_vector, indices);
+      result.insert(result.end(), result_.begin(), result_.end());
+      return result;
+    }
+
+    template <typename Number>
+    MutableBlockVectorSliceT<Number>
+    get_time(BlockVectorT<Number> &block_vector,
+             VectorT<Number>      &prev_vector) const
+    {
+      AssertDimension(1, this->n_variables());
+      MutableBlockVectorSliceT<Number> result;
+      std::vector<unsigned int>        indices = get_time(0);
+      result.reserve(indices.size() + 1);
+      result.push_back(std::ref(prev_vector));
+      auto result_ = get_slice(block_vector, indices);
+      result.insert(result.end(), result_.begin(), result_.end());
+      return result;
+    }
+
     template <typename Number>
     BlockVectorSliceT<Number>
     get_variable(const BlockVectorT<Number> &block_vector,
@@ -1222,6 +1274,24 @@ namespace dealii
 
   template <typename Number>
   void
+  get_linear_combination(BlockVectorT<Number>       &mean,
+                         BlockSlice const           &blk_src,
+                         std::vector<double> const  &weights,
+                         BlockVectorT<Number> const &x)
+  {
+    mean.reinit(blk_src.n_variables());
+    for (unsigned int v = 0; v < blk_src.n_variables(); ++v)
+      {
+        BlockVectorSliceT<Number> src_v = blk_src.get_time(x, v);
+        mean.block(v).reinit(src_v[0].get());
+
+        for (unsigned int i = 0; i < src_v.size(); ++i)
+          mean.block(v).add(static_cast<Number>(weights[i]), src_v[i].get());
+      }
+  }
+
+  template <typename Number>
+  void
   extrapolate_nonlinear(BlockVectorT<Number>       &x_extrapolated,
                         FullMatrix<Number> const   &matrix,
                         BlockSlice const           &blk_src,
@@ -1231,6 +1301,25 @@ namespace dealii
     for (unsigned int v = 0; v < blk_src.n_variables(); ++v)
       {
         BlockVectorSliceT<Number>        src_v = blk_src.get_time(x, prev_x, v);
+        MutableBlockVectorSliceT<Number> dst_v =
+          blk_src.get_time(x_extrapolated, v);
+        AssertDimension(matrix.m(), dst_v.size());
+        AssertDimension(matrix.n(), src_v.size());
+        tensorproduct(dst_v, matrix, src_v);
+      }
+  }
+
+  template <typename Number>
+  void
+  extrapolate_nonlinear(BlockVectorT<Number>       &x_extrapolated,
+                        FullMatrix<Number> const   &matrix,
+                        BlockSlice const           &blk_src,
+                        BlockVectorT<Number> const &x,
+                        VectorT<Number> const      &prev_x)
+  {
+    for (unsigned int v = 0; v < blk_src.n_variables(); ++v)
+      {
+        BlockVectorSliceT<Number>        src_v = blk_src.get_time(x, prev_x);
         MutableBlockVectorSliceT<Number> dst_v =
           blk_src.get_time(x_extrapolated, v);
         AssertDimension(matrix.m(), dst_v.size());
@@ -1322,6 +1411,17 @@ namespace dealii
           tw[i].scatter_matrix_to(variable_indices, {0}, ret[i]);
       }
     return ret;
+  }
+
+  template <typename Number>
+  BlockVectorSliceT<Number>
+  copy_blocks(const BlockVectorT<Number> &bv)
+  {
+    BlockVectorSliceT<Number> refs;
+    refs.reserve(bv.n_blocks());
+    for (unsigned int i = 0; i < bv.n_blocks(); ++i)
+      refs.emplace_back(std::cref(bv.block(i)));
+    return refs;
   }
 
   template <typename Number>
