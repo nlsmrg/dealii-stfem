@@ -1,0 +1,18 @@
+{
+    "relTol": 1.0e-6,
+    "absTol": 1.0e-10,
+    "lambda0": 1.0,
+    "rho": 0.5,
+    "maxIter": 5,
+    "maxLineSearchIter": 3,
+    "nmWindow": 5,
+    "alpha": 1.0e-3,
+    "minStep":1.0e-2,
+    "reductionFactor":0.5,
+    "doUpdate": true,
+    "updateEveryNewtonIter": 0,
+    "updateOnceConverged": false,
+    "linCriticalRel" : 3,
+    "linCriticalAbs" : 10,
+    "lineSearchStrategy": "fixedFactor"
+}
